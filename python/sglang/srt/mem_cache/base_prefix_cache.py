@@ -138,13 +138,29 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         Notify the cache controller to start the KV cache loading
         """
-        raise NotImplementedError()
+        return -1
 
-    def check_hicache_events(self) -> Any:
+    def prefetch(self, req: Req) -> None:
+        return
+
+    def check_kv_events(self) -> Any:
         """
-        Check HiCache related activities to update radix tree and synchronize across TP workers if needed
+        Check HiCache related activities to update radix tree and synchronize across TP workers if needed.
+        Default implementation does nothing (for non-hierarchical cache).
         """
-        raise NotImplementedError()
+        pass
+
+    def can_be_scheduled(self, req: Req) -> bool:
+        """
+        Check if the request can be added to the batch.
+        """
+        return True
+
+    def release_aborted_request(self, req: Req) -> None:
+        """
+        Release the request from the cache.
+        """
+        pass
 
     def take_events(self):
         return []

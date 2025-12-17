@@ -1456,27 +1456,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
-                last_hash = req.last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
-
-                prefix_keys = (
-                    req.last_node.get_prefix_hash_values(req.last_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    req.last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+        self.tree_cache.prefetch(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -1738,8 +1718,8 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+        # Check hierarchical cache events (no-op for non-hierarchical cache)
+        self.tree_cache.check_kv_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
@@ -1796,11 +1776,8 @@ class Scheduler(
                 if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
-            if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
+            if not self.tree_cache.can_be_scheduled(req):
+                continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -1869,11 +1846,9 @@ class Scheduler(
             chunked_req=self.chunked_req,
             dllm_config=self.dllm_config,
         )
-        if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
+        # Setup hierarchical cache loading (returns None for non-hierarchical cache)
+        # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+        new_batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
 
         new_batch.prepare_for_extend()
 
@@ -2354,9 +2329,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
+            # to release prefetch events associated with the request
+            self.tree_cache.release_aborted_request(req)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
