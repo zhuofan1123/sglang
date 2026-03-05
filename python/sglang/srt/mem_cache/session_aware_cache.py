@@ -275,14 +275,14 @@ class SessionAwareCache(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, last_host_node, host_hit_length):
-        return self.inner.init_load_back(last_host_node, host_hit_length)
+    def init_load_back(self, req: Req):
+        return self.inner.init_load_back(req)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
 
-    def check_hicache_events(self):
-        return self.inner.check_hicache_events()
+    def check_kv_events(self):
+        return self.inner.check_kv_events()
 
     def take_events(self):
         return self.inner.take_events()

@@ -877,6 +877,7 @@ class Req(ReqDllmMixin):
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self,
+                    update_connector_state=True,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )

@@ -2063,7 +2063,7 @@ class Scheduler(
             return None
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            self.tree_cache.check_kv_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)

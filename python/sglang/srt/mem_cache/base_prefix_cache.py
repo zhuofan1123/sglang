@@ -41,6 +41,8 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # KVConnector specific
+    update_connector_state: bool = False
 
 
 @dataclasses.dataclass
@@ -188,9 +190,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
-    ) -> Tuple[torch.Tensor, Any]:
+        req: Req,
+    ) -> None:
         """
         Preparing KV cache loading from host to device.
         """
@@ -202,7 +203,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def check_hicache_events(self) -> Any:
+    def check_kv_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """

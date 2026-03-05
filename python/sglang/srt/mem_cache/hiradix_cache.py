@@ -44,6 +44,7 @@ from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
@@ -1059,11 +1060,10 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
+        req: Req,
         mem_quota: Optional[int] = None,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        last_node = req.last_node
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -1087,7 +1087,7 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def check_hicache_events(self):
+    def check_kv_events(self):
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
