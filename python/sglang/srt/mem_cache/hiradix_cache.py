@@ -1063,22 +1063,21 @@ class HiRadixCache(RadixCache):
         req: Req,
         mem_quota: Optional[int] = None,
     ):
-        last_node = req.last_node
+        last_node = req.last_host_node
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                req.prefix_indices = torch.cat([req.prefix_indices, loading_values])
+                req.last_node = last_node
+                return
 
             while last_node.evicted:
                 last_node = last_node.parent
-
-        return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
-        )
+            
+            req.last_node = last_node
 
     def ready_to_load_host_cache(self) -> int:
         """
