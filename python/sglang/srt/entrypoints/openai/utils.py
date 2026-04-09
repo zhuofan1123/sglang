@@ -101,16 +101,11 @@ def process_cached_tokens_details_from_ret(
     if details is None:
         return None
 
-    # Check if L3 storage fields are present
+    kwargs = {
+        "device": details.get("device", 0),
+        "host": details.get("host", 0),
+    }
     if "storage" in details:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-            storage=details.get("storage", 0),
-            storage_backend=details.get("storage_backend"),
-        )
-    else:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-        )
+        kwargs["storage"] = details.get("storage", 0)
+        kwargs["storage_backend"] = details.get("storage_backend")
+    return CachedTokensDetails(**kwargs)

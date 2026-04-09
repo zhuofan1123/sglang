@@ -51,34 +51,51 @@ class SchedulerOutputProcessorMixin:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
+    def _get_kv_connector_backend_type(self) -> str:
+        """Get KV connector backend type from extended radix cache."""
+        connector = getattr(self.tree_cache, "_connector", None)
+        if connector is None:
+            return "none"
+        return type(connector).__name__
+
+
     def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
-            - None if HiCache is not enabled
+            - None if no detailed cache info is available
             - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
             - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+            - {"device": X, "storage": Y} when KV connector (e.g., FlexKV) matched Y tokens
         """
-        # Only show details if HiCache is enabled
-        if not getattr(self, "enable_hierarchical_cache", False):
-            return None
+        details = None
 
-        # Only show if there are any cached tokens
-        if (
-            req.cached_tokens_device > 0
-            or req.cached_tokens_host > 0
-            or req.cached_tokens_storage > 0
-        ):
-            details = {
-                "device": req.cached_tokens_device,
-                "host": req.cached_tokens_host,
-            }
-            # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
-                details["storage"] = req.cached_tokens_storage
-                details["storage_backend"] = self._get_storage_backend_type()
-            return details
-        return None
+        if getattr(self, "enable_hierarchical_cache", False):
+            if (
+                req.cached_tokens_device > 0
+                or req.cached_tokens_host > 0
+                or req.cached_tokens_storage > 0
+            ):
+                details = {
+                    "device": req.cached_tokens_device,
+                    "host": req.cached_tokens_host,
+                }
+                # Only include storage fields if L3 storage is enabled
+                if getattr(self, "enable_hicache_storage", False):
+                    details["storage"] = req.cached_tokens_storage
+                    details["storage_backend"] = self._get_storage_backend_type()
+
+        if getattr(self, "enable_kv_connector", False):
+            if (
+                req.cached_tokens_device > 0
+                or req.cached_tokens_extended_device > 0
+            ):
+                details = {
+                    "device": req.cached_tokens_device,
+                    "storage": req.cached_tokens_extended_device,
+                    "storage_backend": self._get_kv_connector_backend_type(),
+                }
+        return details
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE

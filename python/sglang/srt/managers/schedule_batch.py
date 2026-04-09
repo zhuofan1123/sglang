@@ -640,6 +640,8 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        # Tokens matched by KV connector (e.g., FlexKV) for this request.
+        self.cached_tokens_extended_device = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref

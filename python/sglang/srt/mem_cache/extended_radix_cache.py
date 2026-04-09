@@ -109,6 +109,8 @@ class ExtendedRadixCache(BasePrefixCache):
 
         uncached_len = len(key) - device_indices.numel()
         if uncached_len <= 0:
+            if params.req is not None:
+                params.req.cached_tokens_extended_device = 0
             return device_match_result
 
         token_mask = torch.zeros(len(key), dtype=torch.bool)
@@ -120,7 +122,9 @@ class ExtendedRadixCache(BasePrefixCache):
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
         )
-
+        if params.req is not None:
+            params.req.cached_tokens_extended_device = new_hit_length
+            
         return MatchResult(
             device_indices=device_indices,
             last_device_node=last_device_node,
