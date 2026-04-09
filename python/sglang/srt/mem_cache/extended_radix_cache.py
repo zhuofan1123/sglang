@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -130,11 +131,13 @@ class ExtendedRadixCache(BasePrefixCache):
 
     def init_load_back(
         self,
-        req: Req,
-        mem_quota: Optional[int] = None,
+        params: InitLoadBackParams,
     ) -> None:
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
+        req = params.req
         if self._connector is None:
-            return
+            return torch.empty((0,), dtype=torch.int64, device=self.device), last_node
 
         host_hit_length = req.host_hit_length
 
@@ -142,7 +145,7 @@ class ExtendedRadixCache(BasePrefixCache):
             mem_quota is not None and host_hit_length > mem_quota
         ):
             self._connector.release_load_state(req.rid)
-            return
+            return torch.empty((0,), dtype=torch.int64, device=self.device), last_node
 
         device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
             host_hit_length
@@ -158,7 +161,7 @@ class ExtendedRadixCache(BasePrefixCache):
                 host_hit_length,
             )
             self._connector.release_load_state(req.rid)
-            return
+            return torch.empty((0,), dtype=torch.int64, device=self.device), last_node
 
         gpu_cached_len = len(req.prefix_indices)
         key = RadixKey(
@@ -187,8 +190,7 @@ class ExtendedRadixCache(BasePrefixCache):
             )
         )
 
-        req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
-        req.last_node = new_node
+        return device_indices, new_node
 
     def ready_to_load_host_cache(self) -> int:
         if self._connector is None or not self._load_queue:
@@ -231,6 +233,11 @@ class ExtendedRadixCache(BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)
+
+    def flush_write_through_acks(self) -> None:
+        if self._connector is None:
+            return
+        self._check_store_completion()
 
     def check_kv_events(self):
         if self._connector is None:
