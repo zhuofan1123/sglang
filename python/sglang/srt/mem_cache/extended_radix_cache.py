@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode, page_align_keys
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -208,16 +208,51 @@ class ExtendedRadixCache(BasePrefixCache):
         return task_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        # Save kv_committed_len before inner cache_finished_req pops it.
+        kv_committed_len = req.kv_committed_len
+
+        token_ids = None
+        cache_to_connector = False
+        if self._connector is not None and is_insert:
+            req_id = req.req_pool_idx
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+            token_ids = page_align_keys(token_ids, self.page_size)
+            if len(token_ids) > 0 and req_id is not None:
+                cache_to_connector = True
+
+        # Let the inner radix tree do insert + free duplicates + dec_lock_ref.
         self._inner_radixtree.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
-        if self._connector is None or not is_insert:
+        if not cache_to_connector:
             return
 
-        req_id = req.req_pool_idx
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        kv_indices = self._inner_radixtree.req_to_token_pool.req_to_token[
-            req_id, : len(token_ids)
-        ]
+        # Re-match the tree to get the actual leaf node and its kv_indices
+        # AFTER insert.  These kv_indices are the tree node values (not the
+        # req_to_token_pool snapshot), so they are protected by lock_ref and
+        # won't be freed by the allocator while D2H transfer is in flight.
+        radix_key = RadixKey(token_ids, req.extra_key)
+        match_result = self._inner_radixtree.match_prefix(
+            MatchPrefixParams(key=radix_key)
+        )
+        new_last_node = match_result.last_device_node
+        if new_last_node is None or new_last_node is self._inner_radixtree.root_node:
+            return
+
+        kv_indices = match_result.device_indices
+        if kv_indices is None or kv_indices.numel() == 0:
+            return
+
+        if len(token_ids) != kv_indices.numel():
+            logger.warning(
+                "[FlexKV] cache_finished_req: length mismatch! "
+                "len(token_ids)=%d, kv_indices.numel()=%d, skipping store",
+                len(token_ids), kv_indices.numel(),
+            )
+            return
+
+        # Lock the resolved tree node BEFORE starting async D2H transfer
+        # so that evict cannot free these pages while transfer is in flight.
+        self._inner_radixtree.inc_lock_ref(new_last_node)
 
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
@@ -228,8 +263,7 @@ class ExtendedRadixCache(BasePrefixCache):
             kv_indices=kv_indices,
         )
 
-        self._inner_radixtree.inc_lock_ref(req.last_node)
-        self._ongoing_store_tasks[task_id] = req.last_node
+        self._ongoing_store_tasks[task_id] = new_last_node
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)

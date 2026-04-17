@@ -334,7 +334,12 @@ class FlexKVConnector(BaseKVConnector):
             )
             hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
             if not update_state_for_load and flexkv_task_id >= 0:
-                self.kv_manager.cancel_tasks([flexkv_task_id])
+                # Only cancel if the task actually has pending work.  When
+                # hit_length == 0 the transfer graph is empty and the task was
+                # already marked COMPLETED synchronously, so cancelling would
+                # trigger a spurious "already completed" warning.
+                if hit_length > 0:
+                    self.kv_manager.cancel_tasks([flexkv_task_id])
 
         if self.tp_group is not None and self.tp_size > 1:
             data = broadcast_pyobj(
