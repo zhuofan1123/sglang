@@ -101,7 +101,7 @@ class FlexKVConnector(BaseKVConnector):
 
         # ---- Initialize FlexKV config ----
         self.flexkv_config = FlexKVConfig.from_env()
-        self.flexkv_config.post_init_from_sglang_config(
+        rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sglang_model_config,
             server_args=server_args,
             page_size=self.page_size,
@@ -111,25 +111,16 @@ class FlexKVConnector(BaseKVConnector):
             attn_cp_rank=attn_cp_rank,
         )
 
-        flexkv_model_config = self.flexkv_config.model_config
+        model_config = self.flexkv_config.model_config
+        cache_config = self.flexkv_config.cache_config
+        self.rank_info = rank_info
 
         # Structured logging label
-        rank_parts = []
-        if flexkv_model_config.tp_size > 1:
-            rank_parts.append(f"tp_rank={flexkv_model_config.tp_rank}")
-        if flexkv_model_config.pp_size > 1:
-            rank_parts.append(f"pp_rank={flexkv_model_config.pp_rank}")
-        if flexkv_model_config.dp_size > 1:
-            rank_parts.append(f"dp_rank={flexkv_model_config.dp_rank}")
-        if flexkv_model_config.attn_cp_size > 1:
-            rank_parts.append(f"attn_cp_rank={flexkv_model_config.attn_cp_rank}")
-        if flexkv_model_config.attn_tp_size > 1:
-            rank_parts.append(f"attn_tp_rank={flexkv_model_config.attn_tp_rank}")
-        self._rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
+        self._rank_label = f" [model_config={model_config}, rank_info={rank_info}]"
 
         # ---- Communication / sync context ----
         self._sync_ctx = FlexKVComm(
-            flexkv_model_config=flexkv_model_config,
+            rank_info=rank_info,
             world_rank=(
                 torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             ),
@@ -146,9 +137,9 @@ class FlexKVConnector(BaseKVConnector):
 
 
         # ---- Align block counts on unified group (single all_reduce MIN) ----
-        for _attr in ("num_cpu_blocks", "num_ssd_blocks"):
+        for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
             _orig = getattr(self.flexkv_config.cache_config, _attr)
-            if _orig <= 0:
+            if _orig is None or _orig <= 0:
                 continue
             _aligned = self._sync_ctx.all_reduce_min(_orig)
             logger.debug(
@@ -162,15 +153,10 @@ class FlexKVConnector(BaseKVConnector):
                 )
             setattr(self.flexkv_config.cache_config, _attr, _aligned)
 
-        if flexkv_model_config.nnodes > 1:
+        if model_config.nnodes > 1:
             logger.info(
                 f"[FlexKV] Multi-node detected{self._rank_label}: "
-                f"tp_size={flexkv_model_config.tp_size}, tp_size_per_node={flexkv_model_config.tp_size_per_node}, "
-                f"node_rank={flexkv_model_config.node_rank}, "
-                f"attn_tp_size={flexkv_model_config.attn_tp_size}, "
-                f"attn_cp_size={flexkv_model_config.attn_cp_size}, "
-                f"dp_size={flexkv_model_config.dp_size}, pp_size={flexkv_model_config.pp_size}, "
-                f"nnodes={flexkv_model_config.nnodes}"
+                f"model_config={model_config}, rank_info={rank_info}"
             )
 
         # Build unified kv_caches list (MLA vs MHA)
@@ -196,23 +182,25 @@ class FlexKVConnector(BaseKVConnector):
 
         # ---- Node B: Launch TransferManagerOnRemote ----
         self._remote_process = None
-        if flexkv_model_config.nnodes > 1 and flexkv_model_config.node_rank > 0 and flexkv_model_config.local_rank == 0:
+        if model_config.nnodes > 1 and rank_info.node_rank > 0 and rank_info.local_rank == 0:
             logger.debug(
                 f"[FlexKV] Launching TransferManagerOnRemote{self._rank_label}: "
-                f"master_host={self.flexkv_config.model_config.master_host}")
+                f"master_host={self.flexkv_config.model_config.master_host}, "
+                f"master_ports={self.flexkv_config.model_config.master_ports}")
             self._remote_process = TransferManagerOnRemote.create_process(
                 master_host=self.flexkv_config.model_config.master_host,
+                master_ports=self.flexkv_config.model_config.master_ports,
             )
             logger.info(
-                f"[FlexKV] Launched TransferManagerOnRemote on node_rank={flexkv_model_config.node_rank}"
+                f"[FlexKV] Launched TransferManagerOnRemote on node_rank={rank_info.node_rank}"
                 f"{self._rank_label}"
             )
 
         if self._sync_ctx.is_sync_leader:
             self.kv_manager = KVManager(
-                model_config=self.flexkv_config.model_config,
-                cache_config=self.flexkv_config.cache_config,
-                dp_client_id=flexkv_model_config.dp_rank,
+                model_config=model_config,
+                cache_config=cache_config,
+                dp_client_id=rank_info.dp_client_id,
                 server_recv_port=self.flexkv_config.server_recv_port,
                 gpu_register_port=self.flexkv_config.gpu_register_port,
             )
@@ -223,11 +211,13 @@ class FlexKVConnector(BaseKVConnector):
                 f"gpu_register_port={self.flexkv_config.gpu_register_port}")
 
         # ---- GPU Registration Routing ----
+        self.dp_client_id = rank_info.dp_client_id
+        self.pp_rank = rank_info.pp_rank
         self.tp_client = KVTPClient(
             self.flexkv_config.gpu_register_port,
-            dp_rank=flexkv_model_config.dp_rank,
-            pp_rank=flexkv_model_config.pp_rank,
-            device_id=flexkv_model_config.local_rank,
+            dp_client_id=self.dp_client_id,
+            pp_rank=self.pp_rank,
+            device_id=rank_info.local_rank,
         )
 
         # ---- GPU Registration (with retry) ----
@@ -240,12 +230,10 @@ class FlexKVConnector(BaseKVConnector):
             int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
 
-        model_config = self.flexkv_config.model_config
         self.layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
-            pp_rank=model_config.pp_rank,
-            dp_rank=model_config.dp_rank,
-            pp_size=model_config.pp_size,
-            dp_size=model_config.dp_size,
+            dp_client_id=self.dp_client_id,
+            pp_rank=self.pp_rank,
+            model_config=model_config,
         )
         logger.info(
             f"[FlexKV] Eventfd socket path configured{self._rank_label}: "
@@ -277,11 +265,10 @@ class FlexKVConnector(BaseKVConnector):
         self._load_fkv_tids: List[int] = []
         # rid -> flexkv_task_id (prefetch in flight)
         self._ongoing_prefetches: Dict[str, int] = {}
-        cache_cfg = self.flexkv_config.cache_config
         self._prefetch_enabled = bool(
-            cache_cfg.enable_ssd
-            or cache_cfg.enable_remote
-            or cache_cfg.enable_kv_sharing
+            cache_config.enable_ssd
+            or cache_config.enable_remote
+            or cache_config.enable_kv_sharing
         )
 
         if self._sync_ctx.is_sync_leader:
@@ -321,7 +308,7 @@ class FlexKVConnector(BaseKVConnector):
                     f"(waited {wait_count * 10}s, {diag_str})"
                 )
             logger.info(f"[FlexKV] FlexKV is ready{self._rank_label}")
-        elif flexkv_model_config.nnodes > 1 and flexkv_model_config.node_rank > 0:
+        elif model_config.nnodes > 1 and rank_info.node_rank > 0:
             # Node B: no KVManager to wait for, GPU registration retry handles readiness
             logger.info(f"[FlexKV] Node B skipping is_ready wait{self._rank_label}")
 
@@ -329,11 +316,7 @@ class FlexKVConnector(BaseKVConnector):
             f"[FlexKV] Connector initialized{self._rank_label}: "
             f"layerwise_transfer={self.enable_layerwise_transfer}, "
             f"prefetch_enabled={self._prefetch_enabled}, "
-            f"tp_size={flexkv_model_config.tp_size}, dp_size={flexkv_model_config.dp_size}, "
-            f"pp_size={flexkv_model_config.pp_size}, nnodes={flexkv_model_config.nnodes}, "
-            f"attn_tp_size={flexkv_model_config.attn_tp_size}, "
-            f"attn_cp_size={flexkv_model_config.attn_cp_size}, "
-            f"tp_size_per_node={flexkv_model_config.tp_size_per_node}"
+            f"model_config={model_config}, rank_info={rank_info}"
         )
 
     # ---- BaseKVConnector abstract methods ----
@@ -356,8 +339,6 @@ class FlexKVConnector(BaseKVConnector):
             result = self.kv_manager.get_match(
                 token_ids=token_ids_np,
                 token_mask=token_mask,
-                dp_rank=self.flexkv_config.model_config.dp_rank,
-                pp_rank=self.flexkv_config.model_config.pp_rank,
             )
             # get_match returns None when the FlexKV server encounters an
             # error (e.g. in server_client_mode).  Guard against unpacking a
@@ -438,9 +419,8 @@ class FlexKVConnector(BaseKVConnector):
             self._completed_loads.append(task_id)
             return
 
-        flexkv_model_config = self.flexkv_config.model_config
-        if self._sync_ctx.is_pp_receiver:
-            logger.debug(f"[FlexKV] start_load_kv: sending slot_mapping for pp_receiver")
+        if self._sync_ctx.should_send_slot_mapping_to_remote:
+            logger.debug(f"[FlexKV] start_load_kv: sending slot_mapping for cross-node pp_receiver")
             for fkv_tid, slot_map in zip(flexkv_task_ids, slot_mappings):
                 self.send_slot_mapping_to_remote(fkv_tid, slot_map)
 
@@ -541,10 +521,11 @@ class FlexKVConnector(BaseKVConnector):
                 fkv_task_id = payload["fkv_task_id"]
                 unmatched_mask = torch.tensor(payload["unmatched_mask"])
                 if unmatched_mask.sum() > 0 and fkv_task_id >= 0:
-                    filtered = kv_indices[unmatched_mask]
-                    slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
-                    slot_mapping = slot_mapping.to(torch.int64)
-                    self.send_slot_mapping_to_remote(fkv_task_id, slot_mapping)
+                    if self._sync_ctx.should_send_slot_mapping_to_remote:
+                        filtered = kv_indices[unmatched_mask]
+                        slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
+                        slot_mapping = slot_mapping.to(torch.int64)
+                        self.send_slot_mapping_to_remote(fkv_task_id, slot_mapping)
                     self._ongoing_stores[task_id] = fkv_task_id
                 else:
                     self._completed_stores.append(task_id)
@@ -571,12 +552,9 @@ class FlexKVConnector(BaseKVConnector):
                 if aligned_len < original_len:
                     token_ids_np = token_ids_np[:aligned_len]
                     kv_indices = kv_indices[:aligned_len]
-
             result = self.kv_manager.put_match(
                 token_ids=token_ids_np,
                 token_mask=None,
-                dp_rank=self.flexkv_config.model_config.dp_rank,
-                pp_rank=self.flexkv_config.model_config.pp_rank,
             )
             # put_match returns None when the FlexKV server encounters an
             # error (e.g. in server_client_mode).  Treat as a failed store.
@@ -659,7 +637,6 @@ class FlexKVConnector(BaseKVConnector):
             token_ids_np = np.array(token_ids, dtype=np.int64)
             prefetch_task_id = self.kv_manager.prefetch_async(
                 token_ids=token_ids_np,
-                pp_rank=self.flexkv_config.model_config.pp_rank,
             )
             logger.debug(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}")
 
@@ -823,11 +800,6 @@ class FlexKVConnector(BaseKVConnector):
         assert kv_caches[0].ndim == 3, f"Expected 3D tensor, got shape={kv_caches[0].shape}"
 
         is_mla = self.flexkv_config.model_config.use_mla
-        # In PP mode, each stage only owns a subset of layers.
-        # Use the framework's get_pp_indices-derived per-stage count
-        # rather than naively dividing, because layer distribution may
-        # be non-uniform or controlled by SGLANG_PP_LAYER_PARTITION.
-        per_stage_layers = self.flexkv_config.model_config.num_layers_per_pp_stage
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
         # GPU layout uses page_size as tokens_per_block so that the transfer
@@ -836,11 +808,10 @@ class FlexKVConnector(BaseKVConnector):
         # slot stores 1 token, but we present it to FlexKV as
         # [num_blocks/page_size, page_size, num_kv_heads, head_size] so that
         # block_id * block_stride correctly addresses the start of a page.
-        # NOTE: num_layer must be per-stage so that the transfer engine's
-        # gpu_block_type detection (len(gpu_blocks[0]) vs num_layer) matches.
+
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
-            num_layer=per_stage_layers,
+            num_layer=self.rank_info.num_layers_per_pp_stage,
             num_block=num_blocks // self.page_size,
             tokens_per_block=self.page_size,
             num_head=num_kv_heads,
@@ -904,7 +875,7 @@ class FlexKVConnector(BaseKVConnector):
             logger.debug(f"[FlexKV] Layerwise transfer disabled{self._rank_label}")
             return
 
-        self._layer_done_counter = FlexKVLayerDoneCounter(self.flexkv_config.model_config.num_layers_per_pp_stage)
+        self._layer_done_counter = FlexKVLayerDoneCounter(self.rank_info.num_layers_per_pp_stage)
         self._send_eventfds_to_worker()
         logger.info(f"[FlexKV] Initialized layerwise transfer{self._rank_label}")
 
@@ -981,21 +952,22 @@ class FlexKVConnector(BaseKVConnector):
                 # UDS is node-local, so use _per_node TP rank/size so that
                 # LayerwiseWorker builds the correct eventfd tensor shape.
                 num_counters = self._layer_done_counter.num_counters
-
+                model_config = self.flexkv_config.model_config
+                rank_info = self.rank_info
                 # Send 16-byte metadata: tp_rank_per_node, tp_size_per_node, num_layers, num_counters
                 metadata = struct.pack(
                     "iiii",
-                    self.flexkv_config.model_config.tp_rank_per_node,
-                    self.flexkv_config.model_config.tp_size_per_node,
-                    self.flexkv_config.model_config.num_layers_per_pp_stage,
+                    rank_info.tp_rank_per_node,
+                    model_config.tp_size_per_node,
+                    rank_info.num_layers_per_pp_stage,
                     num_counters,
                 )
                 sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                    f"tp_rank_per_node={self.flexkv_config.model_config.tp_rank_per_node}, "
-                    f"tp_size_per_node={self.flexkv_config.model_config.tp_size_per_node}, "
-                    f"num_layers={self.flexkv_config.model_config.num_layers_per_pp_stage}, num_counters={num_counters}"
+                    f"tp_rank_per_node={rank_info.tp_rank_per_node}, "
+                    f"tp_size_per_node={model_config.tp_size_per_node}, "
+                    f"num_layers={rank_info.num_layers_per_pp_stage}, num_counters={num_counters}"
                 )
 
                 for counter_id in range(num_counters):
@@ -1021,7 +993,7 @@ class FlexKVConnector(BaseKVConnector):
                 logger.info(
                     f"[FlexKV] Eventfd setup complete{self._rank_label}: "
                     f"socket={self.layerwise_eventfd_socket}, "
-                    f"counters={num_counters}, layers={self.flexkv_config.model_config.num_layers_per_pp_stage}"
+                    f"counters={num_counters}, layers={rank_info.num_layers_per_pp_stage}"
                 )
                 return
             except Exception as e:

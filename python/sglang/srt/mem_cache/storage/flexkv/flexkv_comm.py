@@ -5,6 +5,7 @@ import os
 import pickle
 import socket
 import struct
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -53,17 +54,37 @@ class FlexKVComm:
     _TAG_PP_BARRIER_BCAST = int.from_bytes(b"FxB3", byteorder="big")
     _TAG_AR_BCAST = int.from_bytes(b"FxAR", byteorder="big")
 
+    # ---- Async-work reaper tunables ----
+    # Background: gloo isend Work objects do not auto-advance their
+    # "completed" state on poll, so a pure poll-based reaper leaks. We
+    # actively wait() the oldest works with a tiny timeout. The watermark
+    # adapts: it grows on stuck reaps (peer slow / asymmetric) and shrinks
+    # back on clean reaps. Empty scatter payloads (~50B over loopback /
+    # LAN) complete in <1ms, so PROBE=1ms is comfortable.
+    _REAP_HIGH_BASE = 1024            # initial / minimum trigger watermark
+    _REAP_HIGH_MAX  = 32768           # cap on the adaptive watermark
+    _REAP_MAX_DRAIN = 512             # bound on works popped per reap call
+    _REAP_PROBE     = timedelta(milliseconds=1)
+    _REAP_LOG_EVERY = 64              # sample-log every N reap calls
+
     def __init__(
         self,
-        flexkv_model_config,
+        rank_info,
         world_rank: int,
         pp_group=None,
         attn_tp_group=None,
         attn_cp_group=None,
     ):
-        self.config = flexkv_model_config
+        model_config = rank_info.model_config
         self.world_rank = world_rank
         self._async_works: List = []
+        # Adaptive watermark for async-work reaping. Grows on stuck reaps
+        # (peer asymmetric / slow), shrinks back to base on clean reaps.
+        self._reap_high: int = self._REAP_HIGH_BASE
+        # Counters for sampled debug logging.
+        self._reap_calls: int = 0
+        self._reap_stuck_total: int = 0
+        self._reap_drained_total: int = 0
 
         # ---- Extract cpu_group from wrapper objects if present ----
         self.pp_cpu_group = (
@@ -81,15 +102,14 @@ class FlexKVComm:
         )
 
         # ---- Dimension sizes ----
-        self.pp_size = flexkv_model_config.pp_size
-        self.attn_tp_size = flexkv_model_config.attn_tp_size
-        self.attn_cp_size = flexkv_model_config.attn_cp_size
+        self.pp_size = model_config.pp_size
+        self.attn_tp_size = model_config.attn_tp_size
+        self.attn_cp_size = model_config.attn_cp_size
 
         # ---- 3D coordinate ----
-        self.pp_rank = flexkv_model_config.pp_rank
-        self.attn_tp_rank = flexkv_model_config.attn_tp_rank
-        self.attn_cp_rank = flexkv_model_config.attn_cp_rank
-        self.is_nsa_cp = flexkv_model_config.is_nsa_cp
+        self.pp_rank = rank_info.pp_rank
+        self.attn_tp_rank = rank_info.attn_tp_rank
+        self.attn_cp_rank = rank_info.attn_cp_rank
 
         # ---- Role resolution ----
         self.is_pp_stage_leader = (self.attn_tp_rank == 0 and self.attn_cp_rank == 0)
@@ -157,13 +177,20 @@ class FlexKVComm:
         self.is_pp_sender = self.is_pp_leader
         self.is_pp_receiver = self.is_pp_stage_leader and not self.is_pp_leader
 
+        self.is_cross_node_pp = (self.pp_size > rank_info.pp_size_per_node)
+        self.should_send_slot_mapping_to_remote = (
+            self.is_pp_receiver and self.is_cross_node_pp
+        )
+
         logger.info(
             f"[FlexKV] Comm init: rank={world_rank}, "
             f"pp={self.pp_rank}/{self.pp_size}, "
             f"tp={self.attn_tp_rank}/{self.attn_tp_size}, "
             f"cp={self.attn_cp_rank}/{self.attn_cp_size}, "
             f"sync_leader={self.is_sync_leader}, "
-            f"stage_leader={self.is_pp_stage_leader}"
+            f"stage_leader={self.is_pp_stage_leader}, "
+            f"is_cross_node_pp={self.is_cross_node_pp}, "
+            f"should_send_slot_mapping_to_remote={self.should_send_slot_mapping_to_remote}"
         )
 
     # ==================================================================
@@ -303,12 +330,10 @@ class FlexKVComm:
                 for w in works:
                     w.wait()
             else:
-                # Drain completed works when list grows beyond threshold
-                # to prevent unbounded growth, but do NOT wait eagerly —
-                # that would deadlock when gloo isend.wait() blocks until
-                # the peer posts a matching irecv.
-                if len(self._async_works) > 4096:
-                    self._drain_async_works()
+                # Reap completed works to bound list growth, but never
+                # block on a peer that hasn't posted recv yet — the
+                # reaper uses a tiny timeout and bails out on stuck.
+                self._reap_completed_async_works()
                 self._async_works.extend(works)
             return data
         else:
@@ -318,21 +343,70 @@ class FlexKVComm:
     # Async work management
     # ==================================================================
 
-    def _drain_async_works(self):
-        """Wait for all pending async works to complete and clear the list.
+    def _reap_completed_async_works(self):
+        """Drain oldest completed isends with bounded main-thread cost.
 
-        First removes already-completed works without blocking, then waits
-        for the remaining ones.  This avoids unnecessary blocking on works
-        whose peer has already posted a matching recv.
+        gloo's Work.is_completed() does not auto-advance on poll, so a
+        pure-poll reaper leaks. Here we actively wait() the oldest works
+        with a tiny timeout: on a symmetric channel the head of the
+        queue has been in flight for many seconds and its matching recv
+        is long posted, so wait() returns in microseconds. On timeout
+        (peer slow / asymmetric) we break immediately so the main thread
+        is never blocked, and widen the trigger watermark via exponential
+        backoff. On a clean reap we shrink the watermark back toward the
+        base. When the peer recovers we converge back to steady-state.
         """
-        still_pending = []
-        for w in self._async_works:
-            if w.is_completed():
-                continue
-            still_pending.append(w)
-        for w in still_pending:
-            w.wait()
-        self._async_works.clear()
+        n = len(self._async_works)
+        if n <= self._reap_high:
+            return
+
+        drained = 0
+        stuck = False
+        for _ in range(self._REAP_MAX_DRAIN):
+            if not self._async_works:
+                break
+            w = self._async_works[0]
+            try:
+                w.wait(self._REAP_PROBE)
+            except RuntimeError:
+                # Oldest work still pending → newer ones are even less
+                # likely to be ready. Bail out; next reap will retry.
+                stuck = True
+                break
+            self._async_works.pop(0)
+            drained += 1
+
+        # Update counters (used for sampled summary log below).
+        self._reap_calls += 1
+        self._reap_drained_total += drained
+        if stuck:
+            self._reap_stuck_total += 1
+
+        # Adapt watermark. Log on every actual transition — these are
+        # rare and informative on their own.
+        prev_high = self._reap_high
+        if stuck:
+            self._reap_high = min(self._REAP_HIGH_MAX, self._reap_high * 2)
+        else:
+            self._reap_high = max(self._REAP_HIGH_BASE, self._reap_high // 2)
+        if self._reap_high != prev_high:
+            logger.debug(
+                f"[FlexKV] reap watermark rank={self.world_rank} "
+                f"{prev_high}->{self._reap_high} "
+                f"(stuck={stuck} drained={drained} backlog={n})"
+            )
+
+        # Sampled summary every N calls so steady-state behavior is
+        # observable without flooding the log.
+        if self._reap_calls % self._REAP_LOG_EVERY == 0:
+            logger.debug(
+                f"[FlexKV] reap stats rank={self.world_rank} "
+                f"calls={self._reap_calls} "
+                f"drained_total={self._reap_drained_total} "
+                f"stuck_total={self._reap_stuck_total} "
+                f"backlog={len(self._async_works)} "
+                f"high={self._reap_high}"
+            )
 
     # ==================================================================
     # Low-level send / recv
