@@ -137,6 +137,7 @@ class ExtendedRadixCache(BasePrefixCache):
             token_mask=token_mask,
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
+            device_indices=device_indices,
         )
 
         if params.req is not None:
@@ -521,10 +522,23 @@ class ExtendedRadixCache(BasePrefixCache):
         if not cache_to_connector:
             return
 
-        # Re-match the tree to get the actual leaf node and its kv_indices
-        # AFTER insert.  These kv_indices are the tree node values (not the
-        # req_to_token_pool snapshot), so they are protected by lock_ref and
-        # won't be freed by the allocator while D2H transfer is in flight.
+        self._flexkv_store_prefix(token_ids, req, tag="cache_finished_req")
+
+    def _flexkv_store_prefix(self, token_ids, req, tag: str) -> None:
+        """Re-match ``token_ids`` to the resolved leaf node and launch an async
+        D2H store of its kv_indices to the external connector.
+
+        The node is pinned via inc_lock_ref BEFORE the async transfer so evict
+        cannot free the pages while D2H is in flight; the pin is released in
+        _check_store_completion. On SWARadixCache this pins BOTH full_lock_ref
+        and a bounded swa_lock_ref window (returning swa_uuid_for_lock, which is
+        threaded back to dec_lock_ref). Shared by cache_finished_req and the
+        prefill-end cache_unfinished_req store.
+        """
+        # Re-match the tree to get the actual leaf node and its kv_indices AFTER
+        # insert. These kv_indices are tree node values (not the req_to_token
+        # snapshot), so they are protected by lock_ref and won't be freed by the
+        # allocator while D2H transfer is in flight.
         radix_key = RadixKey(token_ids, req.extra_key)
         match_result = self._inner_radixtree.match_prefix(
             MatchPrefixParams(key=radix_key)
@@ -537,39 +551,32 @@ class ExtendedRadixCache(BasePrefixCache):
         if kv_indices is None or kv_indices.numel() == 0:
             return
 
-        # The radix tree may return fewer indices than tokens passed in. Common
-        # causes:
-        #   * EAGLE bigram mode: ``len(key) == len(token_ids) - 1``, so the
-        #     match anchors on N-1 bigrams and ``device_indices`` is sized to
-        #     N-1, then page-aligned (truncating the unmatched tail).
-        #   * Page-alignment in ``match_prefix``: SWARadixCache truncates the
-        #     key to a page-aligned length before traversal.
-        # We cannot store more tokens than we have indices for, so truncate
-        # ``token_ids`` to match ``kv_indices`` length.  If after truncation
-        # nothing remains, skip the store (typical for very short requests).
+        # The radix tree may return fewer indices than tokens passed in (EAGLE
+        # bigram mode; page-alignment in match_prefix). We cannot store more
+        # tokens than we have indices for, so truncate token_ids to match.
         if len(token_ids) > kv_indices.numel():
             token_ids = token_ids[: kv_indices.numel()]
         if len(token_ids) == 0:
             return
         if len(token_ids) != kv_indices.numel():
             logger.warning(
-                "[FlexKV] cache_finished_req: irrecoverable length mismatch! "
+                "[FlexKV] %s: irrecoverable length mismatch! "
                 "len(token_ids)=%d, kv_indices.numel()=%d, skipping store",
-                len(token_ids), kv_indices.numel(),
+                tag, len(token_ids), kv_indices.numel(),
             )
             return
 
-        # Lock the resolved tree node BEFORE starting async D2H transfer
-        # so that evict cannot free these pages while transfer is in flight.
-        # On SWARadixCache, inc_lock_ref locks both full_lock_ref and a
-        # bounded prefix of swa_lock_ref (up to sliding_window_size from the
-        # leaf). It returns ``IncLockRefResult.swa_uuid_for_lock`` which
-        # MUST be passed to dec_lock_ref so the SWA-side release walks the
-        # exact same range. Plain RadixCache returns the result but ignores
-        # the SWA fields, so this also works there.
+        # Lock the resolved tree node BEFORE starting async D2H transfer so that
+        # evict cannot free these pages while transfer is in flight. On
+        # SWARadixCache, inc_lock_ref locks both full_lock_ref and a bounded
+        # prefix of swa_lock_ref (up to sliding_window_size from the leaf). It
+        # returns IncLockRefResult.swa_uuid_for_lock which MUST be passed to
+        # dec_lock_ref so the SWA-side release walks the exact same range. Plain
+        # RadixCache returns the result but ignores the SWA fields, so this also
+        # works there.
         inc_result = self._flexkv_inc_lock(
             new_last_node,
-            "cache_finished_req:flexkv_store",
+            f"{tag}:flexkv_store",
             rid=req.rid,
             token_count=len(token_ids),
             node_id=getattr(new_last_node, "id", None),
@@ -696,8 +703,35 @@ class ExtendedRadixCache(BasePrefixCache):
     def dec_lock_ref(self, *args, **kwargs):
         return self._inner_radixtree.dec_lock_ref(*args, **kwargs)
 
-    def cache_unfinished_req(self, *args, **kwargs):
-        return self._inner_radixtree.cache_unfinished_req(*args, **kwargs)
+    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs):
+        # Inner cache inserts the committed prefix and pins it for the ongoing
+        # request: SWARadixCache.cache_unfinished_req calls inc_lock_ref on the
+        # new leaf, which locks full_lock_ref on [leaf, root] AND swa_lock_ref
+        # within the sliding window, storing swa_uuid_for_lock on the req. That
+        # pin is held through decode until cache_finished_req releases it, so
+        # decode cannot evict / overwrite this prefix's SWA window.
+        self._inner_radixtree.cache_unfinished_req(req, chunked=chunked, **kwargs)
+
+        # Prefill-end (optimized) store: persist the prompt prefix's full + SWA
+        # KV to the external connector ONCE, at the prefill->decode boundary.
+        # Gated on `not chunked`: cache_unfinished_req also fires at every prefill
+        # chunk boundary (chunked=True), where storing a partial prefix would be
+        # wasted work / risk attaching to a partial-prefix node. Only the final,
+        # non-chunked call corresponds to "prompt fully prefilled".
+        if self._connector is None or chunked:
+            return
+
+        # Committed prefix length is what the inner cache just inserted/pinned.
+        protected_len = getattr(req, "cache_protected_len", 0)
+        if protected_len <= 0:
+            return
+        token_ids = req.fill_ids[:protected_len]
+        page_aligned_len = (len(token_ids) // self.page_size) * self.page_size
+        token_ids = token_ids[:page_aligned_len]
+        if len(token_ids) == 0 or req.req_pool_idx is None:
+            return
+
+        self._flexkv_store_prefix(token_ids, req, tag="cache_unfinished_req")
 
     def evictable_size(self):
         inner = self._inner_radixtree

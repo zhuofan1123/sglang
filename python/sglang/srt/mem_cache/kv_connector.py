@@ -44,6 +44,7 @@ class BaseKVConnector(ABC):
         token_mask: torch.Tensor,
         update_state_for_load: bool = False,
         rid: Optional[str] = None,
+        device_indices: Optional["torch.Tensor"] = None,
     ) -> int:
         """Return number of externally cached tokens beyond the device hit.
 
@@ -53,6 +54,8 @@ class BaseKVConnector(ABC):
             update_state_for_load: Lock internal state until the load is
                 started or cancelled via *rid*.
             rid: Request id for tracking the subsequent load task.
+            device_indices: GPU KV indices already resident for the device
+                hit prefix; used to derive the SWA-pool residency mask.
         Returns:
             Number of new matched tokens.
         """
