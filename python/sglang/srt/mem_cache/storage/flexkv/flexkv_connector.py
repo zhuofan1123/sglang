@@ -333,8 +333,9 @@ class FlexKVConnector(BaseKVConnector):
         # MUST run BEFORE KVManager is constructed: in server_client_mode the
         # cache_config is pickled into the KVServer subprocess at KVManager()
         # time, so cache_config.swa has to be populated first or the server's
-        # GlobalCacheEngine builds no swa_index and get_match_swa's RPC returns
-        # an empty return_mask_swa. (The auto-derive below is a fallback for when
+        # GlobalCacheEngine builds no SWA host pool and get_match_swa's RPC
+        # returns an empty return_mask_swa. (The auto-derive below is a fallback
+        # for when
         # upstream config didn't set cache_config.swa; with the old ordering it
         # fired after KVManager and never reached the engine — in-process too.)
         self._kvcache = kvcache  # Store full kvcache for translate_loc_from_full_to_swa
