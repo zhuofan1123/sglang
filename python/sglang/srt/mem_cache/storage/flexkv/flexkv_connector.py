@@ -30,7 +30,9 @@ try:
     from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
     from flexkv.transfer_manager import TransferManagerOnRemote
 except ImportError as e:
-    raise RuntimeError("FlexKV is not installed. Please install it.") from e
+    raise RuntimeError(
+        f"Failed to import FlexKV: {e}"
+    ) from e
 
 logger = logging.getLogger(__name__)
 
