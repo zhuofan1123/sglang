@@ -4,7 +4,7 @@ import os
 import socket
 import struct
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -259,10 +259,14 @@ class FlexKVConnector(BaseKVConnector):
 
         # rid -> flexkv_task_id (pending loads awaiting start_load_kv)
         self._pending_loads: Dict[str, int] = {}
-        # ext_task_id -> producer_id (layerwise loads in flight)
-        self._ongoing_loads: Dict[int, int] = {}
+        # ext_task_id -> (producer_id, flexkv_task_ids) for layerwise loads
+        self._ongoing_loads: Dict[int, Tuple[int, List[int]]] = {}
+        # ext_task_id -> flexkv_task_ids for non-layerwise loads
+        self._ongoing_non_layerwise_loads: Dict[int, List[int]] = {}
         # ext_task_ids whose load has completed
         self._completed_loads: List[int] = []
+        # ext_task_id -> monotonic launch timestamp for diagnostics
+        self._load_launch_times: Dict[int, float] = {}
         # ext_task_id -> flexkv_task_id (stores in flight)
         self._ongoing_stores: Dict[int, int] = {}
         # ext_task_ids whose store has completed or was skipped
@@ -332,6 +336,32 @@ class FlexKVConnector(BaseKVConnector):
 
     # ---- BaseKVConnector abstract methods ----
 
+    def _scatter_dict(
+        self,
+        payload: Dict[str, Any],
+        defaults: Dict[str, Any],
+        context: str,
+    ) -> Dict[str, Any]:
+        data = self._sync_ctx.scatter(payload)
+        if isinstance(data, dict):
+            return data
+        if (
+            isinstance(data, (list, tuple))
+            and len(data) == 1
+            and isinstance(data[0], dict)
+        ):
+            return data[0]
+
+        logger.warning(
+            "[FlexKV] %s scatter returned unexpected payload type=%s value=%s. "
+            "Using defaults=%s",
+            context,
+            type(data).__name__,
+            data,
+            defaults,
+        )
+        return defaults
+
     def get_new_hit_length(
         self,
         token_ids: List[int],
@@ -376,8 +406,10 @@ class FlexKVConnector(BaseKVConnector):
                 logger.debug(f"[FlexKV Connector] gpu hit length: {gpu_hit_length}, Flexkv hit length: {hit_length}")
 
         if self._sync_ctx.needs_sync:
-            data = self._sync_ctx.scatter(
+            data = self._scatter_dict(
                 {"hit_length": hit_length, "task_id": flexkv_task_id},
+                {"hit_length": 0, "task_id": -1},
+                "get_new_hit_length",
             )
             hit_length = data["hit_length"]
             flexkv_task_id = data["task_id"]
@@ -429,6 +461,10 @@ class FlexKVConnector(BaseKVConnector):
         logger.debug(f"[FlexKV] start_load_kv: resolved {len(flexkv_task_ids)} flexkv tasks")
         if not flexkv_task_ids:
             self._completed_loads.append(task_id)
+            logger.debug(
+                "[FlexKV] start_load_kv skipped: ext_task_id=%d reason=no_flexkv_task",
+                task_id,
+            )
             return
 
         if self._sync_ctx.should_send_slot_mapping_to_remote:
@@ -436,6 +472,7 @@ class FlexKVConnector(BaseKVConnector):
             for fkv_tid, slot_map in zip(flexkv_task_ids, slot_mappings):
                 self.send_slot_mapping_to_remote(fkv_tid, slot_map)
 
+        self._load_launch_times[task_id] = time.perf_counter()
         if self.enable_layerwise_transfer and self._layer_done_counter is not None:
             # PP1+: receive counter_id from PP0 first
             if self._sync_ctx.is_pp_receiver:
@@ -465,7 +502,7 @@ class FlexKVConnector(BaseKVConnector):
                     counter_id=producer_id,
                 )
                 self._load_fkv_tids.extend(flexkv_task_ids)
-            self._ongoing_loads[task_id] = producer_id
+            self._ongoing_loads[task_id] = (producer_id, flexkv_task_ids)
         else:
             if self._sync_ctx.is_sync_leader:
                 self.kv_manager.launch(
@@ -474,41 +511,105 @@ class FlexKVConnector(BaseKVConnector):
                     as_batch=True,
                     layerwise_transfer=False,
                 )
-                response = self.kv_manager.wait(flexkv_task_ids, timeout=30.0)
-                if not all(
-                    tid in response and response[tid].status == KVResponseStatus.SUCCESS
-                    for tid in flexkv_task_ids
-                ):
-                    logger.warning(
-                        "[FlexKV] Some tasks failed in non-layerwise transfer"
-                    )
-
-            if self._sync_ctx.needs_sync:
-                self._sync_ctx.barrier()
-
-            self._completed_loads.append(task_id)
+            self._ongoing_non_layerwise_loads[task_id] = flexkv_task_ids
 
     def check_completed_load_tasks(self) -> List[int]:
         if self._sync_ctx.is_sync_leader and len(self._load_fkv_tids) >= 100:
             self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
             self._load_fkv_tids.clear()
 
+        if self._sync_ctx.is_sync_leader and self._ongoing_non_layerwise_loads:
+            for ext_tid, fkv_tids in list(self._ongoing_non_layerwise_loads.items()):
+                completed = self.kv_manager.try_wait(task_ids=fkv_tids)
+                if not all(tid in completed for tid in fkv_tids):
+                    continue
+
+                ok = all(
+                    completed[tid].status == KVResponseStatus.SUCCESS
+                    for tid in fkv_tids
+                )
+                if not ok:
+                    logger.warning(
+                        "[FlexKV] Some tasks failed in non-layerwise load "
+                        "ext_task_id=%d flexkv_task_ids=%s",
+                        ext_tid,
+                        fkv_tids,
+                    )
+                self._completed_loads.append(ext_tid)
+                del self._ongoing_non_layerwise_loads[ext_tid]
+                self._log_load_done(ext_tid, ok=ok, layerwise=False)
+
         if self._layer_done_counter is not None:
-            for ext_tid, producer_id in list(self._ongoing_loads.items()):
-                if self._layer_done_counter.events[producer_id]._finished:
+            for ext_tid, (producer_id, fkv_tids) in list(self._ongoing_loads.items()):
+                done = False
+                ok = True
+                done_by_task_poll = False
+                if self._sync_ctx.is_sync_leader and fkv_tids:
+                    completed = self.kv_manager.try_wait(task_ids=fkv_tids)
+                    if all(tid in completed for tid in fkv_tids):
+                        ok = all(
+                            completed[tid].status == KVResponseStatus.SUCCESS
+                            for tid in fkv_tids
+                        )
+                        done = True
+                        done_by_task_poll = True
+                elif self._layer_done_counter.events[producer_id]._finished:
+                    done = True
+
+                if done:
+                    if done_by_task_poll:
+                        self._layer_done_counter.events[producer_id]._finished = True
+                    if not ok:
+                        logger.warning(
+                            "[FlexKV] Some tasks failed in layerwise load "
+                            "ext_task_id=%d flexkv_task_ids=%s",
+                            ext_tid,
+                            fkv_tids,
+                        )
                     self._completed_loads.append(ext_tid)
                     del self._ongoing_loads[ext_tid]
+                    self._log_load_done(ext_tid, ok=ok, layerwise=True)
 
         result = list(self._completed_loads)
         self._completed_loads.clear()
+        if self._sync_ctx.needs_sync:
+            result = self._sync_ctx.scatter(result)
+            for ext_tid in result:
+                self._ongoing_non_layerwise_loads.pop(ext_tid, None)
+                layerwise_entry = self._ongoing_loads.pop(ext_tid, None)
+                if layerwise_entry is not None and self._layer_done_counter is not None:
+                    producer_id, _ = layerwise_entry
+                    self._layer_done_counter.events[producer_id]._finished = True
+                self._load_launch_times.pop(ext_tid, None)
         return result
+
+    def cancel_load_task(self, task_id: int) -> None:
+        if task_id < 0:
+            return
+
+        fkv_tids = self._ongoing_non_layerwise_loads.pop(task_id, [])
+        layerwise_entry = self._ongoing_loads.pop(task_id, None)
+        if layerwise_entry is not None:
+            producer_id, layerwise_tids = layerwise_entry
+            fkv_tids.extend(layerwise_tids)
+            if self._layer_done_counter is not None:
+                self._layer_done_counter.events[producer_id]._finished = True
+
+        self._load_launch_times.pop(task_id, None)
+        if fkv_tids and self._sync_ctx.is_sync_leader:
+            self.kv_manager.cancel(fkv_tids)
+            logger.info(
+                "[FlexKV] Cancelled load task ext_task_id=%d flexkv_task_ids=%s",
+                task_id,
+                fkv_tids,
+            )
 
     def start_store_kv(
         self,
         task_id: int,
         token_ids: List[int],
         kv_indices: torch.Tensor,
-    ) -> None:
+    ) -> bool:
 
         def _send_pp_put_meta(fkv_task_id: int, unmatched_mask):
             if not self._sync_ctx.is_pp_active:
@@ -541,7 +642,7 @@ class FlexKVConnector(BaseKVConnector):
                     self._ongoing_stores[task_id] = fkv_task_id
                 else:
                     self._completed_stores.append(task_id)
-            return
+            return True
 
         try:
             token_ids_np = np.array(token_ids, dtype=np.int64)
@@ -560,7 +661,7 @@ class FlexKVConnector(BaseKVConnector):
                 if aligned_len == 0:
                     _send_pp_put_meta(fkv_task_id=-1, unmatched_mask=[])
                     self._completed_stores.append(task_id)
-                    return
+                    return True
                 if aligned_len < original_len:
                     token_ids_np = token_ids_np[:aligned_len]
                     kv_indices = kv_indices[:aligned_len]
@@ -574,7 +675,7 @@ class FlexKVConnector(BaseKVConnector):
                 logger.warning("[FlexKV] put_match returned None, skipping store for task %d", task_id)
                 _send_pp_put_meta(fkv_task_id=-1, unmatched_mask=[])
                 self._completed_stores.append(task_id)
-                return
+                return False
             fkv_task_id, unmatched_mask = result
 
             logger.debug(
@@ -594,12 +695,15 @@ class FlexKVConnector(BaseKVConnector):
                     task_ids=[fkv_task_id], slot_mappings=[slot_mapping]
                 )
                 self._ongoing_stores[task_id] = fkv_task_id
+                return True
             else:
                 self._completed_stores.append(task_id)
+                return True
         except Exception as e:
             logger.error("[FlexKV] start_store_kv failed: %s", e, exc_info=True)
             _send_pp_put_meta(fkv_task_id=-1, unmatched_mask=[])
             self._completed_stores.append(task_id)
+            return False
 
     def check_completed_store_tasks(self) -> List[int]:
         completed_ext_ids = list(self._completed_stores)
@@ -659,8 +763,10 @@ class FlexKVConnector(BaseKVConnector):
             logger.info(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}, actual_prefetch_tokens={actual_prefetch_tokens}")
 
         if self._sync_ctx.needs_sync:
-            data = self._sync_ctx.scatter(
+            data = self._scatter_dict(
                 {"task_id": prefetch_task_id, "actual_prefetch_tokens": actual_prefetch_tokens},
+                {"task_id": -1, "actual_prefetch_tokens": 0},
+                "prefetch",
             )
             prefetch_task_id = data["task_id"]
             actual_prefetch_tokens = data["actual_prefetch_tokens"]
@@ -694,10 +800,12 @@ class FlexKVConnector(BaseKVConnector):
 
                 if resp.return_mask is not None:
                     loaded_tokens =int(np.sum(resp.return_mask))
-                
+
         if self._sync_ctx.needs_sync:
-            data = self._sync_ctx.scatter(
+            data = self._scatter_dict(
                 {"is_completed": is_completed, "loaded_tokens": 0},
+                {"is_completed": False, "loaded_tokens": 0},
+                "check_prefetch_progress",
             )
             is_completed = data["is_completed"]
 
@@ -743,9 +851,18 @@ class FlexKVConnector(BaseKVConnector):
                 self.kv_manager.cancel(pending_tids)
         self._pending_loads.clear()
         self._ongoing_prefetches.clear()
+        if self._sync_ctx.is_sync_leader:
+            for fkv_tids in list(self._ongoing_non_layerwise_loads.values()):
+                if fkv_tids:
+                    self.kv_manager.cancel(fkv_tids)
+            for _, fkv_tids in list(self._ongoing_loads.values()):
+                if fkv_tids:
+                    self.kv_manager.cancel(fkv_tids)
         self._ongoing_loads.clear()
+        self._ongoing_non_layerwise_loads.clear()
         self._completed_loads.clear()
         self._load_fkv_tids.clear()
+        self._load_launch_times.clear()
 
         if self._sync_ctx.is_sync_leader:
             for fk_tid in list(self._ongoing_stores.values()):
@@ -778,6 +895,21 @@ class FlexKVConnector(BaseKVConnector):
             self._remote_process = None
 
     # ---- Private helpers ----
+
+    def _log_load_done(self, ext_tid: int, ok: bool, layerwise: bool) -> None:
+        launch_ts = self._load_launch_times.pop(ext_tid, None)
+        elapsed_ms = (
+            (time.perf_counter() - launch_ts) * 1000
+            if launch_ts is not None
+            else -1.0
+        )
+        logger.debug(
+            "[FlexKV] load done ext_task_id=%d elapsed_ms=%.3f status=%s layerwise=%s",
+            ext_tid,
+            elapsed_ms,
+            "success" if ok else "failed",
+            layerwise,
+        )
 
     def _wait_flexkv_task(self, fk_task_id: int, timeout: float = 20.0) -> bool:
         if fk_task_id < 0 or not self._sync_ctx.is_sync_leader:

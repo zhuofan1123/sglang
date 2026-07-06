@@ -599,13 +599,26 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
-            self._delete_leaf(x)
+            if not self._is_valid_evictable_leaf(x):
+                if x in self.evictable_leaves:
+                    self.evictable_leaves.remove(x)
+                logger.warning(
+                    "Skip stale radix evictable leaf: node_id=%s key_len=%s",
+                    getattr(x, "id", None),
+                    len(x.key) if x.key is not None else None,
+                )
+                continue
 
-            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            parent = x.parent
+            value = x.value
+            self.token_to_kv_pool_allocator.free(value)
+            num_evicted += len(value)
+            if not self._delete_leaf(x):
+                continue
+
+            if len(parent.children) == 0 and parent.lock_ref == 0:
+                new_priority = self.eviction_strategy.get_priority(parent)
+                heapq.heappush(eviction_heap, (new_priority, parent))
 
             self._record_remove_event(x)
 
@@ -714,6 +727,10 @@ class RadixCache(BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
+        self._update_leaf_status(new_node.parent)
+        self._update_leaf_status(new_node)
+        self._update_leaf_status(child)
+
         return new_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
@@ -796,15 +813,45 @@ class RadixCache(BasePrefixCache):
                     child.key
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
+    def _is_valid_evictable_leaf(self, node: TreeNode) -> bool:
+        if (
+            node is self.root_node
+            or node.parent is None
+            or node.evicted
+            or node.lock_ref > 0
+        ):
+            return False
+
+        key = self.get_child_key_fn(node.key)
+        if node.parent.children.get(key) is not node:
+            return False
+
+        for child in node.children.values():
+            if not child.evicted:
+                return False
+        return True
+
     def _delete_leaf(self, node):
         key = self.get_child_key_fn(node.key)
-        v = node.parent.children.pop(key, None)
-        assert v == node, f"parent does not have child key, {key}"
+        parent = node.parent
+        v = parent.children.get(key)
+        if v is not node:
+            if node in self.evictable_leaves:
+                self.evictable_leaves.remove(node)
+            logger.warning(
+                "Skip deleting stale radix leaf: node_id=%s key=%s",
+                getattr(node, "id", None),
+                key,
+            )
+            return False
+        del parent.children[key]
 
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
-        self._update_leaf_status(node.parent)
+        node.value = None
+        self._update_leaf_status(parent)
+        return True
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0:

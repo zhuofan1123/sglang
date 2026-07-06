@@ -44,7 +44,37 @@ class DisaggregationMode(Enum):
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
-def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
+def _is_fake_metadata_transfer(req, server_args) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and server_args.disaggregation_transfer_backend == "fake"
+    )
+
+
+def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> None:
+    """Downgrade Success to Transferring until the metadata buffer is populated."""
+    from sglang.srt.disaggregation.base import KVPoll
+
+    for i, poll_val in enumerate(polls):
+        if poll_val != int(KVPoll.Success):
+            continue
+        decode_req = decode_reqs[i]
+        if _is_fake_metadata_transfer(decode_req.req, server_args):
+            continue
+        actual_room = metadata_buffers.bootstrap_room[
+            decode_req.metadata_buffer_index, 0
+        ].item()
+        if actual_room == 0:
+            polls[i] = int(KVPoll.Transferring)
+
+
+def poll_and_all_reduce(
+    pollers,
+    gloo_group: dist.ProcessGroup,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args=None,
+):
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
@@ -55,6 +85,13 @@ def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
+    if (
+        decode_reqs is not None
+        and metadata_buffers is not None
+        and server_args is not None
+    ):
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
+
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
@@ -211,22 +248,34 @@ class MetadataBuffers:
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.cached_tokens[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
-            self.output_hidden_states[idx],
-            self.bootstrap_room[idx],
+            self.output_ids[idx].clone(),
+            self.cached_tokens[idx].clone(),
+            self.output_token_logprobs_val[idx].clone(),
+            self.output_token_logprobs_idx[idx].clone(),
+            self.output_top_logprobs_val[idx].clone(),
+            self.output_top_logprobs_idx[idx].clone(),
+            self.output_topk_p[idx].clone(),
+            self.output_topk_index[idx].clone(),
+            self.output_hidden_states[idx].clone(),
+            self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+        self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
+        self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
+        self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+        if req.multimodal_inputs and hasattr(
+            req.multimodal_inputs, "compute_mm_token_counts"
+        ):
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.cached_tokens[req.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.metadata_buffer_index][6] = video_t
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

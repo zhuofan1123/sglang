@@ -96,13 +96,16 @@ class BaseKVConnector(ABC):
         task_id: int,
         token_ids: List[int],
         kv_indices: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """Asynchronously store KV cache to external storage.
 
         Args:
             task_id: Caller-assigned id for completion tracking.
             token_ids: Token id sequence to store.
             kv_indices: Corresponding GPU KV pool indices.
+        Returns:
+            True if the store was launched or completed as a no-op. False when
+            the connector could not accept the store.
         """
         ...
 

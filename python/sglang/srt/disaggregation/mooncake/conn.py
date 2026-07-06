@@ -73,6 +73,7 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    decode_prefix_len: Optional[int] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -99,6 +100,9 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            decode_prefix_len=(
+                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
         )
 
 
@@ -914,6 +918,7 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -953,6 +958,14 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.req_to_decode_prefix_len[room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in self.transfer_infos[room].values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1208,6 +1221,8 @@ class MooncakeKVSender(CommonKVSender):
     def clear(self) -> None:
         if self.bootstrap_room in self.kv_mgr.request_status:
             self.kv_mgr.request_status.pop(self.bootstrap_room)
+        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -1300,6 +1315,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1331,6 +1347,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(decode_prefix_len or 0).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

@@ -45,6 +45,9 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_flexkv_offload_manager import (
+    DecodeFlexKVOffloadManager,
+)
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -338,6 +341,10 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_kv_connector = server_args.kv_connector_cls is not None
+        self.enable_decode_hicache = (
+            server_args.disaggregation_decode_enable_radix_cache
+            and (self.enable_hierarchical_cache or self.enable_kv_connector)
+        )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -857,6 +864,18 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.kv_connector_cls is not None
+            and server_args.kv_connector_cls.lower() == "flexkv"
+        ):
+            self.decode_flexkv_offload_manager = DecodeFlexKVOffloadManager(
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_flexkv_offload_manager = None
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

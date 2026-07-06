@@ -369,13 +369,25 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            if getattr(self, "decode_flexkv_offload_manager", None) is not None:
+                self.decode_flexkv_offload_manager.check_offload_progress()
+                store_inflight_count = getattr(
+                    self.tree_cache, "store_inflight_count", None
+                )
+                if callable(store_inflight_count):
+                    queue_size += store_inflight_count()
             if queue_size:
                 return
         elif self.enable_hisparse:
             if self.hisparse_coordinator.has_ongoing_staging():
                 return
 
-        self.check_memory()
+        if not (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.enable_kv_connector
+            and not envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get()
+        ):
+            self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()

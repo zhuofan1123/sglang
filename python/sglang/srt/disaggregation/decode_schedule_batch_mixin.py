@@ -27,7 +27,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [
+            r.fill_ids[
+                len(r.prefix_indices) : len(r.prefix_indices) + r.extend_input_len
+            ]
+            for r in reqs
+        ]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
         pre_lens = []
@@ -41,9 +46,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         offset = 0
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
+            pre_len = len(req.prefix_indices)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
+                pre_len : pre_len + req.extend_input_len
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -51,7 +57,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
-            pre_len = len(req.prefix_indices)
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
@@ -60,7 +65,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                delta = max(0, pre_len - req.already_computed)
+                req.cached_tokens += delta
+                req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)

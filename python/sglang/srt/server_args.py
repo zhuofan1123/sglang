@@ -694,6 +694,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
@@ -3174,8 +3175,9 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            if not self.disaggregation_decode_enable_radix_cache:
+                self.disable_radix_cache = True
+                logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -5713,6 +5715,11 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-radix-cache",
+            action="store_true",
+            help="Enable radix cache on decode server (PD mode). Required when using --kv-connector-cls on decode.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",

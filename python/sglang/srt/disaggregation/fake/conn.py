@@ -56,9 +56,10 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: list[int],
         aux_index: Optional[int] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         logger.debug(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}, decode_prefix_len: {decode_prefix_len}"
         )
         pass
 
@@ -74,6 +75,12 @@ class FakeKVSender(BaseKVSender):
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
+
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
 
 
 class FakeKVReceiver(BaseKVReceiver):
@@ -100,10 +107,11 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         self.has_init = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}, decode_prefix_len: {decode_prefix_len}"
         )
 
     def failure_exception(self):

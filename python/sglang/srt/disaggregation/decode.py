@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -34,6 +34,13 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCachePreallocMixin,
+    DecodeHiCacheTransferMixin,
+    DecodePrefixMatch,
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -52,7 +59,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -61,12 +72,14 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import get_num_new_pages
 
 logger = logging.getLogger(__name__)
 
@@ -218,13 +231,18 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    prefix_match: Optional[DecodePrefixMatch] = None
+    hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    hicache_restored_node: Any = None
+    hicache_restored_kv_indices: Optional[torch.Tensor] = None
+    hicache_load_consumer_index: int = -1
 
     @property
     def seqlen(self) -> int:
         return self.req.seqlen
 
 
-class DecodePreallocQueue:
+class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
     """
@@ -412,6 +430,62 @@ class DecodePreallocQueue:
             DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
         )
 
+    def _match_prefix_and_lock(
+        self, req: Req, external_hit_budget: Optional[int] = None
+    ) -> DecodePrefixMatch:
+        max_prefix_len = len(req.origin_input_ids)
+        if req.return_logprob and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        token_ids = req.origin_input_ids[:max_prefix_len]
+
+        if external_hit_budget is not None:
+            req.decode_external_hit_budget = external_hit_budget
+        try:
+            match_result = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+                    req=req,
+                    cow_mamba=self.tree_cache.supports_mamba(),
+                    update_connector_state=True,
+                )
+            )
+        finally:
+            if external_hit_budget is not None and hasattr(
+                req, "decode_external_hit_budget"
+            ):
+                delattr(req, "decode_external_hit_budget")
+        req.prefix_indices = match_result.device_indices.to(
+            dtype=torch.int64, device=self.token_to_kv_pool_allocator.device
+        )
+        (
+            req.last_node,
+            req.last_host_node,
+            req.host_hit_length,
+            req.mamba_branching_seqlen,
+        ) = (
+            match_result.last_device_node,
+            match_result.last_host_node,
+            match_result.host_hit_length,
+            match_result.mamba_branching_seqlen,
+        )
+        if match_result.cache_protected_len is not None:
+            req.cache_protected_len = match_result.cache_protected_len
+        else:
+            req.cache_protected_len = len(req.prefix_indices)
+
+        self.tree_cache.inc_lock_ref(match_result.last_device_node)
+        return self._build_decode_prefix_match(req, match_result)
+
+    def _release_prefix_match(
+        self, req: Req, prefix_match: Optional[DecodePrefixMatch]
+    ) -> None:
+        if prefix_match is not None:
+            self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+            if prefix_match.needs_local_restore and hasattr(
+                self.tree_cache, "release_aborted_request"
+            ):
+                self.tree_cache.release_aborted_request(req.rid)
+
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
@@ -443,18 +517,35 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len,
+                prefix_len=0,
+            )
             required_tokens_for_request = (
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + self.num_reserved_decode_tokens
+                required_alloc_tokens + self.num_reserved_decode_tokens
             )
             if required_tokens_for_request > allocatable_tokens:
+                break
+
+            kv_loc = self._pre_alloc(req, fail_on_oom=True)
+            if kv_loc is None:
+                logger.warning(
+                    "Skip resuming retracted decode request due to KV pressure: "
+                    "rid=%s fill_len=%d required_alloc_tokens=%d "
+                    "allocatable_tokens=%d available_size=%d evictable_size=%d",
+                    req.rid,
+                    fill_len,
+                    required_alloc_tokens,
+                    allocatable_tokens,
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.tree_cache.evictable_size(),
+                )
                 break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
             allocatable_tokens -= required_tokens_for_request
 
             # load from cpu, release the cpu copy
@@ -647,14 +738,41 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
+            prefix_match: Optional[DecodePrefixMatch] = None
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                external_hit_budget = self._decode_external_hit_budget(
+                    allocatable_tokens
+                )
+                prefix_match = self._match_prefix_and_lock(
+                    decode_req.req, external_hit_budget=external_hit_budget
+                )
+                prefix_indices = prefix_match.prefix_indices
+                prefix_len = prefix_match.l1_prefix_len
+                total_prefix_len = prefix_match.decode_prefix_len
+                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                required_alloc_tokens = self._required_alloc_tokens(
+                    fill_len=fill_len,
+                    prefix_len=prefix_len,
+                )
+                allocatable_tokens = self._allocatable_tokens(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                )
+            else:
+                prefix_indices = None
+                prefix_len = 0
+                total_prefix_len = 0
+                required_alloc_tokens = origin_input_len
+
             required_tokens_for_request = (
-                origin_input_len + self.num_reserved_decode_tokens
+                required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
             if (
                 max(
                     required_tokens_for_request,
                     origin_input_len
+                    - prefix_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKEN,
@@ -663,16 +781,46 @@ class DecodePreallocQueue:
                 )
                 > allocatable_tokens
             ):
+                self._release_prefix_match(decode_req.req, prefix_match)
                 break
             if required_tokens_for_request > allocatable_tokens:
+                self._release_prefix_match(decode_req.req, prefix_match)
+                break
+
+            kv_loc = self._pre_alloc(
+                decode_req.req,
+                prefix_indices,
+                prefix_len,
+                total_prefix_len,
+                fail_on_oom=True,
+            )
+            if kv_loc is None:
+                logger.warning(
+                    "Skip preallocating decode request due to KV pressure: "
+                    "rid=%s origin_input_len=%d prefix_len=%d total_prefix_len=%d "
+                    "required_alloc_tokens=%d allocatable_tokens=%d "
+                    "available_size=%d evictable_size=%d",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    prefix_len,
+                    total_prefix_len,
+                    required_alloc_tokens,
+                    allocatable_tokens,
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.tree_cache.evictable_size(),
+                )
+                self._release_prefix_match(decode_req.req, prefix_match)
                 break
 
             allocatable_tokens -= required_tokens_for_request
-            self._pre_alloc(decode_req.req)
+            decode_req.prefix_match = prefix_match
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+            decode_req.req.cache_protected_len = total_prefix_len
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
+                    total_prefix_len:origin_input_len
                 ]
                 .cpu()
                 .numpy()
@@ -724,7 +872,10 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
-                page_indices, decode_req.metadata_buffer_index, state_indices
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                decode_prefix_len=total_prefix_len,
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -759,6 +910,8 @@ class DecodePreallocQueue:
             else 0
         )
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
@@ -790,47 +943,123 @@ class DecodePreallocQueue:
                     for req in self.retracted_queue
                 ]
             )
+        if self.scheduler.enable_decode_hicache:
+            allocatable_tokens -= self._hicache_pending_restore_tokens()
         return allocatable_tokens
 
-    def _pre_alloc(self, req: Req) -> torch.Tensor:
-        """Pre-allocate the memory for req_to_token and token_kv_pool"""
+    def _required_alloc_tokens(self, fill_len: int, prefix_len: int) -> int:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size == 1:
+            return fill_len - prefix_len
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64),
+            prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
+            page_size=page_size,
+        )
+        return num_new_pages * page_size
+
+    def _pre_alloc(
+        self,
+        req: Req,
+        prefix_indices: Optional[torch.Tensor] = None,
+        prefix_len: Optional[int] = None,
+        total_prefix_len: Optional[int] = None,
+        fail_on_oom: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Pre-allocate req_to_token and token_kv_pool for decode-side PD."""
+        if prefix_len is None:
+            prefix_len = 0
+        if total_prefix_len is None:
+            total_prefix_len = prefix_len
+
+        device = self.token_to_kv_pool_allocator.device
+        if prefix_len > 0:
+            prefix_indices = prefix_indices.to(dtype=torch.int64, device=device)
+        else:
+            prefix_indices = torch.empty((0,), dtype=torch.int64, device=device)
+
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        if req_pool_indices is None:
+            if fail_on_oom:
+                return None
+            assert (
+                req_pool_indices is not None
+            ), "req_pool_indices is full! There is a bug in memory estimation."
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
-        else:
-            device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
+
+        if prefix_len > 0:
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
+        delta_len = fill_len - total_prefix_len
+        required_alloc_tokens = self._required_alloc_tokens(
+            fill_len=fill_len,
+            prefix_len=total_prefix_len,
+        )
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
+        ):
+            num_to_evict = (
+                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
+            )
+            self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+        else:
+            last_loc = (
+                prefix_indices[-1:].to(dtype=torch.int64, device=device)
+                if prefix_len > 0
+                else torch.tensor([-1], dtype=torch.int64, device=device)
+            )
+            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+            )
+
+        if kv_loc is None:
+            self.req_to_token_pool.free(req)
+            req.kv_allocated_len = 0
+            req.kv_committed_len = 0
+            if fail_on_oom:
+                return None
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
+
+        self.req_to_token_pool.write(
+            (
+                req.req_pool_idx,
+                slice(total_prefix_len, total_prefix_len + len(kv_loc)),
+            ),
+            kv_loc,
+        )
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
-        req.set_extend_input_len(len(req.fill_ids))
+        req.fill_len = req.kv_committed_len
+        req.prefix_indices = prefix_indices
+        req.set_extend_input_len(req.fill_len - total_prefix_len)
 
         return kv_loc
 
 
-class DecodeTransferQueue:
+class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
     """
@@ -913,9 +1142,18 @@ class DecodeTransferQueue:
             decode_req.kv_receiver = None
             return True
 
+        self._commit_hicache_local_restore_to_req(decode_req)
+
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        decode_req.req.already_computed = decode_req.req.cached_tokens
+        decode_req.req.cached_tokens_device = cached_tokens[1].item()
+        decode_req.req.cached_tokens_host = cached_tokens[2].item()
+        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        decode_req.req.mm_image_tokens = cached_tokens[4].item()
+        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
+        decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -940,24 +1178,51 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
+    def _poll_with_metadata_gate(self) -> List[int]:
+        pollers = (
+            [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
+            if self.scheduler.enable_decode_hicache
+            else [dr.kv_receiver for dr in self.queue]
+        )
+        return poll_and_all_reduce(
+            pollers,
+            self.gloo_group,
+            decode_reqs=self.queue,
+            metadata_buffers=self.metadata_buffers,
+            server_args=self.scheduler.server_args,
+        )
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(
+                [
+                    decode_req
+                    for decode_req in self.queue
+                    if rids_to_check is None or decode_req.req.rid in rids_to_check
+                ]
+            )
+
+        polls = self._poll_with_metadata_gate()
 
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            if poll == KVPoll.Failed:
+            hicache_restore_status = decode_req.hicache_restore_status
+            if (
+                poll == KVPoll.Failed
+                or hicache_restore_status == HiCacheRestoreResult.FAILED
+            ):
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
+                if poll == KVPoll.Failed:
+                    try:
+                        decode_req.kv_receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                self._clean_hicache_prefetch_resources(decode_req)
                 logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
@@ -969,11 +1234,18 @@ class DecodeTransferQueue:
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                if (
+                    self.scheduler.enable_decode_hicache
+                    and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
@@ -982,6 +1254,7 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
+                        self._clean_hicache_prefetch_resources(decode_req)
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
@@ -1001,6 +1274,7 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -1167,8 +1441,13 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
+            self.tree_cache.check_kv_events()
+
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
+        if getattr(self, "decode_flexkv_offload_manager", None) is not None:
+            self.decode_flexkv_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

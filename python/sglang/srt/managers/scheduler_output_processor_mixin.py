@@ -450,6 +450,12 @@ class SchedulerOutputProcessorMixin:
                 and not req.finished()
             ):
                 self.decode_offload_manager.offload_kv_cache(req)
+            elif (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and getattr(self, "decode_flexkv_offload_manager", None) is not None
+                and not req.finished()
+            ):
+                self.decode_flexkv_offload_manager.offload_kv_cache(req)
 
             if req.finished():
                 # delete feature to save memory
@@ -469,6 +475,8 @@ class SchedulerOutputProcessorMixin:
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
                     release_kv_cache(req, self.tree_cache)
+                    if getattr(self, "decode_flexkv_offload_manager", None) is not None:
+                        self.decode_flexkv_offload_manager.finalize_request(req)
 
                 req.time_stats.set_completion_time()
 

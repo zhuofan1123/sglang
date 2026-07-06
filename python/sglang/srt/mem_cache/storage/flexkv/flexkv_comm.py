@@ -607,10 +607,19 @@ class FlexKVLayerDoneCounter:
 
     def update_producer(self) -> int:
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ]._finished, "Producer event should be finished before reuse"
+        event = self.events[self.producer_index]
+        if not event._finished:
+            logger.warning(
+                "[FlexKV] Producer slot %d not finished, blocking until "
+                "the last layer event is consumed",
+                self.producer_index,
+            )
+            event.wait(self.num_layers - 1)
         return self.producer_index
+
+    def is_next_slot_ready(self) -> bool:
+        next_index = (self.producer_index + 1) % self.num_counters
+        return self.events[next_index]._finished
 
     def set_consumer(self, task_id: int):
         if task_id < 0:

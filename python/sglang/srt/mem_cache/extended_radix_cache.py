@@ -113,15 +113,52 @@ class ExtendedRadixCache(BasePrefixCache):
                 params.req.cached_tokens_extended_device = 0
             return device_match_result
 
+        external_hit_budget = (
+            getattr(params.req, "decode_external_hit_budget", None)
+            if params.req is not None
+            else None
+        )
+        if external_hit_budget is not None:
+            external_hit_budget = max(int(external_hit_budget), 0)
+            if external_hit_budget == 0:
+                if params.req is not None:
+                    params.req.cached_tokens_extended_device = 0
+                return MatchResult(
+                    device_indices=device_indices,
+                    last_device_node=last_device_node,
+                    last_host_node=last_device_node,
+                    host_hit_length=0,
+                )
+            if external_hit_budget < uncached_len:
+                query_len = device_indices.numel() + external_hit_budget
+                logger.info(
+                    "[FlexKV] Decode external match capped by restore budget: "
+                    "rid=%s uncached_len=%d budget=%d query_len=%d",
+                    params.req.rid if params.req is not None else "?",
+                    uncached_len,
+                    external_hit_budget,
+                    query_len,
+                )
+                key = key[:query_len]
+
         token_mask = torch.zeros(len(key), dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
-        new_hit_length = self._connector.get_new_hit_length(
-            token_ids=key.token_ids,
-            token_mask=token_mask,
-            update_state_for_load=params.update_connector_state,
-            rid=params.req.rid if params.req is not None else None,
-        )
+        try:
+            new_hit_length = self._connector.get_new_hit_length(
+                token_ids=key.token_ids,
+                token_mask=token_mask,
+                update_state_for_load=params.update_connector_state,
+                rid=params.req.rid if params.req is not None else None,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "[FlexKV] get_new_hit_length failed for rid=%s: %s. "
+                "Falling back to device-only prefix match.",
+                params.req.rid if params.req is not None else "?",
+                e,
+            )
+            new_hit_length = 0
 
         if params.req is not None:
             params.req.cached_tokens_extended_device = new_hit_length
@@ -136,20 +173,28 @@ class ExtendedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams
-    ) -> None:
+    ) -> bool:
+        """Prepare connector load-back from external cache to GPU.
+
+        Returns False only when GPU slot allocation fails and the caller should
+        abort the request. True means either load-back was queued or no load was
+        needed.
+        """
         req = params.req
         mem_quota = params.mem_quota
 
+        if req is None:
+            return True
         if self._connector is None:
-            return
+            return True
 
-        host_hit_length = req.host_hit_length
+        host_hit_length = params.host_hit_length
 
         if host_hit_length <= 0 or (
             mem_quota is not None and host_hit_length > mem_quota
         ):
             self._connector.release_load_state(req.rid)
-            return
+            return True
 
         device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
             host_hit_length
@@ -161,11 +206,12 @@ class ExtendedRadixCache(BasePrefixCache):
             )
         if device_indices is None:
             logger.warning(
-                "Failed to allocate %d GPU slots for external load",
+                "Failed to allocate %d GPU slots for external load (rid=%s)",
                 host_hit_length,
+                req.rid,
             )
             self._connector.release_load_state(req.rid)
-            return
+            return False
 
         gpu_cached_len = len(req.prefix_indices)
         key = RadixKey(
@@ -178,9 +224,21 @@ class ExtendedRadixCache(BasePrefixCache):
         new_node.key = key
         new_node.value = device_indices
         new_node.parent = last_node
-        last_node.children[self._inner_radixtree.get_child_key_fn(new_node.key)] = (
-            new_node
-        )
+        child_key = self._inner_radixtree.get_child_key_fn(new_node.key)
+        existing_child = last_node.children.get(child_key)
+        if existing_child is not None:
+            self._discard_evictable_subtree(existing_child)
+            logger.warning(
+                "[FlexKV] Replacing existing radix child during loadback: "
+                "rid=%s child_key=%s gpu_cached_len=%d host_hit_length=%d",
+                req.rid,
+                child_key,
+                gpu_cached_len,
+                host_hit_length,
+            )
+        last_node.children[child_key] = new_node
+        self._inner_radixtree._update_leaf_status(last_node)
+        self._inner_radixtree._update_leaf_status(new_node)
         self._inner_radixtree.evictable_size_ += len(device_indices)
         self._inner_radixtree._record_store_event(new_node)
 
@@ -194,8 +252,12 @@ class ExtendedRadixCache(BasePrefixCache):
             )
         )
 
-        req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
+        prefix_indices = req.prefix_indices.to(
+            dtype=torch.int64, device=device_indices.device
+        )
+        req.prefix_indices = torch.cat([prefix_indices, device_indices])
         req.last_node = new_node
+        return True
 
     def ready_to_load_host_cache(self) -> int:
         if self._connector is None or not self._load_queue:
@@ -204,10 +266,13 @@ class ExtendedRadixCache(BasePrefixCache):
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
 
-        self._connector.start_load_kv(task_id, self._load_queue)
-
         nodes = [op.node for op in self._load_queue]
         self._ongoing_load_tasks[task_id] = nodes
+        self._connector.start_load_kv(task_id, self._load_queue)
+
+        counter = getattr(self._connector, "layer_done_counter", None)
+        if counter is not None and hasattr(counter, "set_consumer"):
+            counter.set_consumer(task_id)
 
         self._load_queue.clear()
         return task_id
@@ -233,44 +298,79 @@ class ExtendedRadixCache(BasePrefixCache):
         if not cache_to_connector:
             return
 
-        # Re-match the tree to get the actual leaf node and its kv_indices
-        # AFTER insert.  These kv_indices are the tree node values (not the
-        # req_to_token_pool snapshot), so they are protected by lock_ref and
-        # won't be freed by the allocator while D2H transfer is in flight.
+        self.start_store_kv_for_token_ids(req, token_ids, event="finished")
+
+    def store_inflight_count(self) -> int:
+        return len(self._ongoing_store_tasks)
+
+    def start_store_kv_for_token_ids(
+        self,
+        req: Req,
+        token_ids: List[int],
+        event: str,
+    ) -> bool:
+        if self._connector is None or len(token_ids) == 0:
+            return False
+
+        # Re-match the tree to get the actual leaf node and its kv_indices.
+        # These kv_indices are owned by the tree, so locking the matched leaf
+        # protects them from eviction while async D2H/remote store is in flight.
         radix_key = RadixKey(token_ids, req.extra_key)
         match_result = self._inner_radixtree.match_prefix(
             MatchPrefixParams(key=radix_key)
         )
         new_last_node = match_result.last_device_node
         if new_last_node is None or new_last_node is self._inner_radixtree.root_node:
-            return
+            return False
 
         kv_indices = match_result.device_indices
         if kv_indices is None or kv_indices.numel() == 0:
-            return
+            return False
 
         if len(token_ids) != kv_indices.numel():
             logger.warning(
-                "[FlexKV] cache_finished_req: length mismatch! "
-                "len(token_ids)=%d, kv_indices.numel()=%d, skipping store",
-                len(token_ids), kv_indices.numel(),
+                "[FlexKV-UnfinishedStore] event=%s status=skip "
+                "reason=length_mismatch rid=%s len_token_ids=%d kv_indices=%d",
+                event,
+                req.rid,
+                len(token_ids),
+                kv_indices.numel(),
             )
-            return
+            return False
 
-        # Lock the resolved tree node BEFORE starting async D2H transfer
-        # so that evict cannot free these pages while transfer is in flight.
         self._inner_radixtree.inc_lock_ref(new_last_node)
 
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
-        
-        self._connector.start_store_kv(
+
+        launched = self._connector.start_store_kv(
             task_id=task_id,
             token_ids=token_ids,
             kv_indices=kv_indices,
         )
+        if launched is False:
+            self._inner_radixtree.dec_lock_ref(new_last_node)
+            logger.warning(
+                "[FlexKV-UnfinishedStore] event=%s status=failed rid=%s "
+                "task_id=%d tokens=%d",
+                event,
+                req.rid,
+                task_id,
+                len(token_ids),
+            )
+            return False
 
         self._ongoing_store_tasks[task_id] = new_last_node
+        logger.info(
+            "[FlexKV-UnfinishedStore] event=%s status=launch rid=%s "
+            "task_id=%d tokens=%d inflight_stores=%d",
+            event,
+            req.rid,
+            task_id,
+            len(token_ids),
+            len(self._ongoing_store_tasks),
+        )
+        return True
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)
@@ -280,6 +380,22 @@ class ExtendedRadixCache(BasePrefixCache):
             return
         self._check_store_completion()
         self._check_load_completion()
+
+    def is_load_back_event_done(self, task_id: int) -> bool:
+        if task_id < 0:
+            return True
+        self._check_load_completion()
+        return task_id not in self._ongoing_load_tasks
+
+    def cancel_load_back(self, task_id: int) -> None:
+        if task_id < 0:
+            return
+        nodes = self._ongoing_load_tasks.pop(task_id, None)
+        if self._connector is not None and hasattr(self._connector, "cancel_load_task"):
+            self._connector.cancel_load_task(task_id)
+        if nodes is not None:
+            for node in nodes:
+                self._inner_radixtree.dec_lock_ref(node)
 
     def prefetch(self, req: Req) -> None:
         if self._connector is None:
@@ -300,6 +416,7 @@ class ExtendedRadixCache(BasePrefixCache):
     def release_aborted_request(self, req_id: str) -> None:
         if self._connector is None:
             return
+        self._connector.release_load_state(req_id)
         self._connector.cancel_prefetch(req_id)
 
     # -- Private helpers --
@@ -318,6 +435,16 @@ class ExtendedRadixCache(BasePrefixCache):
             if nodes is not None:
                 for node in nodes:
                     self._inner_radixtree.dec_lock_ref(node)
+
+    def _discard_evictable_subtree(self, node: TreeNode) -> None:
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur in self._inner_radixtree.evictable_leaves:
+                self._inner_radixtree.evictable_leaves.remove(cur)
+            for child in cur.children.values():
+                if not child.evicted:
+                    stack.append(child)
 
     # -- Pass-through methods --
 

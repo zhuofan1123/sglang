@@ -314,7 +314,14 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            decode_prefix_len = min(
+                req.disagg_kv_sender.pop_decode_prefix_len(), num_kv_indices
+            )
+            req.start_send_idx = decode_prefix_len
+            num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+            num_pages = kv_to_page_num(
+                num_kv_indices_to_send, self.token_to_kv_pool.page_size
+            )
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -714,15 +721,25 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+        fill_len = getattr(req, "fill_len", len(req.fill_ids))
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(fill_len, len(req.origin_input_ids))
         )
 
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
+
+        if end_idx < start_idx:
+            logger.debug(
+                "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
+                req.rid,
+                start_idx,
+                end_idx,
+            )
+            return
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
@@ -748,7 +765,7 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
+                seq_len = min(fill_len, len(req.origin_input_ids))
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -768,7 +785,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
+                seq_len = min(fill_len, len(req.origin_input_ids))
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -776,7 +793,7 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
+        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
