@@ -33,6 +33,7 @@ import struct
 from datetime import timedelta
 from typing import Any, Dict, List
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -45,6 +46,34 @@ logger = logging.getLogger(__name__)
 CMD_PUT_META = 2
 CMD_LAYERWISE = 3
 CMD_STORE_COMPLETE = 5
+
+
+class FlexKVDesyncError(RuntimeError):
+    """Raised when a follower rank receives a scatter payload whose kind /
+    sequence number does not match what it expected.
+
+    The FlexKV scatter channels multiplex several logical message kinds
+    (``lookup`` / ``store_complete`` / ``retrieve`` / ...) over a small set
+    of gloo P2P tags whose FIFO ordering only stays correct if *every* rank
+    issues an identical sequence of ``scatter`` calls. If some rank issues
+    one more (or one fewer) call than the leader, the streams shift by one
+    and a follower reads the wrong message. This exception turns that
+    silent corruption into a located, actionable crash instead of a
+    downstream ``TypeError`` / wrong-KV read.
+    """
+
+
+class _ScatterEnvelope(msgspec.Struct, frozen=True):
+    """Self-describing wrapper the leader puts around every ``scatter`` /
+    ``scatter_pp`` payload so followers can detect stream desync.
+
+    ``seq`` is a per-``kind`` monotonically increasing counter; ``kind`` is
+    the logical message type; ``data`` is the original payload.
+    """
+
+    seq: int
+    kind: str
+    data: Any
 
 
 class FlexKVComm:
@@ -102,6 +131,13 @@ class FlexKVComm:
         self._reap_calls: int = 0
         self._reap_stuck_total: int = 0
         self._reap_drained_total: int = 0
+
+        # Per-kind scatter sequence counters for desync detection. The
+        # leader increments ``_send_seq[kind]`` on each send; every rank
+        # tracks the last ``seq`` it accepted per kind in ``_recv_seq`` and
+        # rejects out-of-order / wrong-kind envelopes.
+        self._send_seq: Dict[str, int] = {}
+        self._recv_seq: Dict[str, int] = {}
 
         # Accept either GroupCoordinator wrappers (has ``.cpu_group``) or
         # raw ProcessGroups.
@@ -209,52 +245,89 @@ class FlexKVComm:
     # Public collectives
     # ------------------------------------------------------------------
 
-    def scatter(self, data: Any, blocking: bool = False) -> Any:
+    def scatter(self, data: Any, *, kind: str, blocking: bool = False) -> Any:
         """Hierarchical fan-out: sync_leader → PP stage leaders →
         CP leaders → TP ranks. Returns the leader's payload on every rank.
 
-        ``blocking=False`` queues isends and reaps later — fine for the
-        hot path; ``True`` blocks until the leader's sends drain (used
-        on shutdown / barriers).
+        ``kind`` labels the logical message so followers can detect stream
+        desync (see :class:`FlexKVDesyncError`). ``blocking=False`` queues
+        isends and reaps later; ``True`` blocks until the sends drain.
         """
+        payload = self._wrap(data, kind, self.is_sync_leader)
         if self.pp_size > 1 and self.is_pp_stage_leader:
-            data = self._scatter_group(
-                data,
+            payload = self._scatter_group(
+                payload,
                 self._pp_stage_leader_ranks,
                 self.is_pp_leader,
                 self._TAG_PP,
                 blocking,
             )
         if self._cp_leader_ranks:
-            data = self._scatter_group(
-                data,
+            payload = self._scatter_group(
+                payload,
                 self._cp_leader_ranks,
                 self.is_cp_leader,
                 self._TAG_CP,
                 blocking,
             )
         if self._tp_group_ranks:
-            data = self._scatter_group(
-                data,
+            payload = self._scatter_group(
+                payload,
                 self._tp_group_ranks,
                 self.is_tp_leader,
                 self._TAG_TP,
                 blocking,
             )
-        return data
+        return self._unwrap(payload, kind, self.is_sync_leader)
 
-    def scatter_pp(self, data: Any) -> Any:
+    def scatter_pp(self, data: Any, *, kind: str) -> Any:
         """PP-only fan-out across PP stages (only stage leaders participate)."""
         if not self._pp_group_global_ranks:
             return data
         is_leader = self._pp_group_global_ranks[0] == self.world_rank
-        return self._scatter_group(
-            data,
+        payload = self._scatter_group(
+            self._wrap(data, kind, is_leader),
             self._pp_group_global_ranks,
             is_leader,
             self._TAG_SCATTER,
             blocking=False,
         )
+        return self._unwrap(payload, kind, is_leader)
+
+    # ------------------------------------------------------------------
+    # Envelope wrap / unwrap + desync self-check
+    # ------------------------------------------------------------------
+
+    def _wrap(self, data: Any, kind: str, is_origin: bool) -> Any:
+        # Only the origin stamps an envelope; a follower's input is
+        # discarded by ``_scatter_group`` (it returns the recv'd value).
+        if not is_origin:
+            return data
+        self._send_seq[kind] = self._send_seq.get(kind, 0) + 1
+        return _ScatterEnvelope(seq=self._send_seq[kind], kind=kind, data=data)
+
+    def _unwrap(self, payload: Any, kind: str, is_origin: bool) -> Any:
+        if is_origin:
+            return payload.data if isinstance(payload, _ScatterEnvelope) else payload
+        if not isinstance(payload, _ScatterEnvelope) or payload.kind != kind:
+            got = (
+                payload.kind
+                if isinstance(payload, _ScatterEnvelope)
+                else type(payload).__name__
+            )
+            raise FlexKVDesyncError(
+                f"[FlexKV] rank={self.world_rank} scatter desync: expected "
+                f"kind={kind!r}, got {got!r} — some rank's scatter call "
+                f"sequence diverged from the leader's."
+            )
+        last = self._recv_seq.get(kind, 0)
+        if payload.seq <= last:
+            raise FlexKVDesyncError(
+                f"[FlexKV] rank={self.world_rank} kind={kind} seq regression: "
+                f"got {payload.seq}, last accepted {last}."
+            )
+        self._recv_seq[kind] = payload.seq
+        return payload.data
 
     def all_reduce_min(self, value: int) -> int:
         """Hierarchical all_reduce(MIN) across TP, CP, PP.

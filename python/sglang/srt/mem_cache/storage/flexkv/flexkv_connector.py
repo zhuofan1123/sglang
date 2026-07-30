@@ -286,7 +286,7 @@ class FlexKVConnector:
 
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"task_id": fkv_task_id, "hit": hit_length}
+                {"task_id": fkv_task_id, "hit": hit_length}, kind="lookup"
             )
             fkv_task_id = payload["task_id"]
             hit_length = payload["hit"]
@@ -394,7 +394,7 @@ class FlexKVConnector:
 
         # Allocate / receive producer slot.
         if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
+            payload = self._sync_ctx.scatter_pp(None, kind="layerwise")
             if payload.get("cmd") != CMD_LAYERWISE:
                 raise RuntimeError(
                     f"Tag mismatch: expected CMD_LAYERWISE, got "
@@ -415,7 +415,8 @@ class FlexKVConnector:
                     "cmd": CMD_LAYERWISE,
                     "fkv_task_id": fkv_task_id,
                     "counter_id": producer_id,
-                }
+                },
+                kind="layerwise",
             )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -515,7 +516,7 @@ class FlexKVConnector:
         # Non-leader path: receive the unmatched mask + maybe forward
         # slot_mapping to the remote-side TransferManager.
         if self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
+            payload = self._sync_ctx.scatter_pp(None, kind="put_meta")
             if payload.get("cmd") != CMD_PUT_META:
                 raise RuntimeError(
                     f"Tag mismatch: expected CMD_PUT_META, got " f"{payload.get('cmd')}"
@@ -559,10 +560,11 @@ class FlexKVConnector:
                 {
                     "cmd": CMD_STORE_COMPLETE,
                     "completed_fk_ids": list(completed_dict),
-                }
+                },
+                kind="store_complete_pp",
             )
         elif self._sync_ctx.is_pp_receiver:
-            payload = self._sync_ctx.scatter_pp(None)
+            payload = self._sync_ctx.scatter_pp(None, kind="store_complete_pp")
             if payload.get("cmd") != CMD_STORE_COMPLETE:
                 raise RuntimeError(
                     f"Tag mismatch: expected CMD_STORE_COMPLETE, got "
@@ -578,7 +580,9 @@ class FlexKVConnector:
                         self._inflight_stores.pop(rid, None)
 
         if self._sync_ctx.needs_sync:
-            completed_rids = self._sync_ctx.scatter(completed_rids)
+            completed_rids = self._sync_ctx.scatter(
+                completed_rids, kind="store_complete"
+            )
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
@@ -614,7 +618,9 @@ class FlexKVConnector:
                 logger.debug("[FlexKV] prefetch_async: %s", exc)
                 task_id = -1
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"task_id": task_id})
+            payload = self._sync_ctx.scatter(
+                {"task_id": task_id}, kind="prefetch_start"
+            )
             task_id = payload["task_id"]
         if task_id >= 0:
             self._ongoing_prefetches[rid] = task_id
@@ -635,7 +641,7 @@ class FlexKVConnector:
             if task_id in completed:
                 done = True
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"done": done})
+            payload = self._sync_ctx.scatter({"done": done}, kind="prefetch_progress")
             done = payload["done"]
         if done:
             self._ongoing_prefetches.pop(rid, None)
@@ -826,7 +832,8 @@ class FlexKVConnector:
                 "cmd": CMD_PUT_META,
                 "fkv_task_id": fkv_task_id,
                 "unmatched_mask": mask_list,
-            }
+            },
+            kind="put_meta",
         )
 
     def _send_slot_mapping_to_remote(
