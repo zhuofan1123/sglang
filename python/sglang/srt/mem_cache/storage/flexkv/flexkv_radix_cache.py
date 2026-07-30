@@ -444,11 +444,16 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def evict(self, params: EvictParams) -> EvictResult:  # type: ignore[override]
-        """Drain completed stores before letting the base evict touch
-        the source nodes."""
+        """Evict device slots. Does NOT drain completed stores here.
+
+        ``evict`` is triggered per-rank on ``available_size()``, but
+        ``_drain_completed_stores`` issues a cross-rank scatter — pairing
+        the two would fire that scatter on a per-rank-conditional path and
+        desync the FIFO stream. The symmetric drain lives in
+        ``check_hicache_events`` (every scheduler tick), which covers it.
+        """
         if self.disable:
             return EvictResult()
-        self._drain_completed_stores()
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()
