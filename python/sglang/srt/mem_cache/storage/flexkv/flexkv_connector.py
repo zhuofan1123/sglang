@@ -365,8 +365,13 @@ class FlexKVConnector:
                     fkv_task_id,
                 )
                 n = 0
+        # Broadcast the leader's real retrieved count so every rank agrees
+        # (leader may have zeroed n on failure). Doubles as the sync point
+        # the old bare barrier provided: followers block until the leader's
+        # transfer wait() completes.
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
+            payload = self._sync_ctx.scatter({"n": n}, kind="retrieve")
+            n = payload["n"]
         return n
 
     def start_load_kv_layerwise(
@@ -455,7 +460,7 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         kv_indices: torch.Tensor,
-    ) -> int:
+    ) -> bool:
         """Schedule a write back from GPU into FlexKV.
 
         On the sync leader this runs ``put_match`` to discover which
@@ -464,8 +469,8 @@ class FlexKVConnector:
         mask is received over the PP fan-out so cross-node PP can
         forward its slot mappings.
 
-        Returns the FlexKV task id of the in-flight store, or -1 if
-        nothing needed to be written.
+        Returns the leader's ``store_created`` flag, broadcast to every
+        rank so all replicas lock/track the source node symmetrically.
         """
         token_ids_np = np.asarray(token_ids, dtype=np.int64)
         n = len(token_ids_np)
@@ -481,12 +486,12 @@ class FlexKVConnector:
             aligned_len = (n // self.page_size) * self.page_size
             if aligned_len == 0:
                 self._send_pp_put_meta(-1, [])
-                return -1
+                return self._broadcast_store_created(False)
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
                 kv_indices = kv_indices[:aligned_len]
 
-        fkv_task_id = -1
+        created = False
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
@@ -495,27 +500,32 @@ class FlexKVConnector:
                 res = None
             if res is None:
                 self._send_pp_put_meta(-1, [])
-                return -1
+                return self._broadcast_store_created(False)
             fkv_task_id, unmatched_mask = res
 
             self._send_pp_put_meta(fkv_task_id, unmatched_mask)
 
             if int(unmatched_mask.sum()) > 0:
-                filtered = kv_indices[unmatched_mask]
-                slot_mapping_cpu = self._to_cpu_int64(filtered)
-                self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    as_batch=False,
-                    layerwise_transfer=False,
-                )
-                self._inflight_stores[rid] = fkv_task_id
-                return fkv_task_id
-            return -1
+                # Wrap launch so the leader always reaches the tail
+                # broadcast that followers block on.
+                try:
+                    filtered = kv_indices[unmatched_mask]
+                    slot_mapping_cpu = self._to_cpu_int64(filtered)
+                    self.kv_manager.launch(
+                        task_ids=[fkv_task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        as_batch=False,
+                        layerwise_transfer=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FlexKV] store_kv launch raised: %s", exc)
+                else:
+                    self._inflight_stores[rid] = fkv_task_id
+                    created = True
 
         # Non-leader path: receive the unmatched mask + maybe forward
         # slot_mapping to the remote-side TransferManager.
-        if self._sync_ctx.is_pp_receiver:
+        elif self._sync_ctx.is_pp_receiver:
             payload = self._sync_ctx.scatter_pp(None, kind="put_meta")
             if payload.get("cmd") != CMD_PUT_META:
                 raise RuntimeError(
@@ -533,7 +543,15 @@ class FlexKVConnector:
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
                 self._inflight_stores[rid] = fkv_task_id
-        return fkv_task_id
+
+        # Every rank adopts the leader's flag so lock tracking stays symmetric.
+        return self._broadcast_store_created(created)
+
+    def _broadcast_store_created(self, created: bool) -> bool:
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter({"created": created}, kind="store_created")
+            created = bool(payload["created"])
+        return created
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""

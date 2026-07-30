@@ -421,7 +421,7 @@ class FlexKVRadixCache(RadixCache):
         self.inc_lock_ref(new_last_node)
         try:
             with torch.cuda.stream(self.store_stream):
-                fkv_task_id = self.flexkv_connector.store_kv(
+                store_created = self.flexkv_connector.store_kv(
                     rid=req.rid,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
@@ -430,9 +430,9 @@ class FlexKVRadixCache(RadixCache):
             self.dec_lock_ref(new_last_node)
             raise
 
-        if fkv_task_id < 0:
-            # Nothing to write back (either everything already in
-            # FlexKV, or put_match failed / returned None).
+        # store_created is the leader's flag broadcast to every rank, so all
+        # replicas lock/track the source node identically (no ref-count drift).
+        if not store_created:
             self.dec_lock_ref(new_last_node)
             return
 
