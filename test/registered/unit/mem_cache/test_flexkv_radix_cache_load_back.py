@@ -919,3 +919,99 @@ def test_reset_attempts_other_allocations_and_retains_failed_free():
     allocator.free.reset_mock(side_effect=True)
     cache.reset()
     allocator.free.assert_called_once_with(first_slots)
+
+
+def _push_cache(evict_local=False):
+    cache, _allocator = _make_cache(page_size=4)
+    cache._push_on_finish = True
+    cache._push_evict_local = evict_local
+    cache._push_after_store = {}
+    return cache
+
+
+def _finish_request(cache, rid="finished-request"):
+    cache.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[4, 5, 6, 7]], dtype=torch.int64)
+    )
+    req = SimpleNamespace(
+        rid=rid,
+        origin_input_ids=[1, 2, 3, 4],
+        output_ids=[],
+        kv=SimpleNamespace(kv_committed_len=4, req_pool_idx=0, cache_protected_len=0),
+        extra_key=None,
+        cache_salt=None,
+        last_node=cache.root_node,
+        _flexkv_uncached_restore=False,
+    )
+    with (
+        patch.dict(
+            FlexKVRadixCache.cache_finished_req.__globals__,
+            {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
+        ),
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
+        patch(
+            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+        ),
+    ):
+        cache.cache_finished_req(req, kv_len_to_handle=4)
+
+
+def test_push_on_finish_pushes_the_prefix_after_its_store_completes():
+    cache = _push_cache(evict_local=True)
+    cache.flexkv_connector.store_kv.return_value = 17
+
+    _finish_request(cache)
+
+    assert cache._push_after_store == {"finished-request": [1, 2, 3, 4]}
+    cache.flexkv_connector.push_async.assert_not_called()
+
+    cache.flexkv_connector.check_completed_stores.return_value = ["finished-request"]
+    cache.check_hicache_events()
+
+    cache.flexkv_connector.push_async.assert_called_once_with(
+        "finished-request",
+        [1, 2, 3, 4],
+        evict_local=True,
+        sglang_req_id="finished-request",
+    )
+    cache.flexkv_connector.check_completed_pushes.assert_called_once_with()
+    assert cache._push_after_store == {}
+    assert cache._inflight_store_nodes == {}
+
+
+def test_push_on_finish_pushes_at_once_when_the_prefix_is_already_stored():
+    cache = _push_cache()
+    cache.flexkv_connector.store_kv.return_value = -1
+
+    _finish_request(cache)
+
+    cache.flexkv_connector.push_async.assert_called_once_with(
+        "finished-request",
+        [1, 2, 3, 4],
+        evict_local=False,
+        sglang_req_id="finished-request",
+    )
+    assert cache._push_after_store == {}
+
+
+def test_push_on_finish_entry_is_dropped_when_the_request_aborts():
+    cache = _push_cache()
+    cache.flexkv_connector.store_kv.return_value = 17
+    _finish_request(cache)
+
+    cache.release_aborted_request("finished-request")
+
+    assert cache._push_after_store == {}
+    cache.flexkv_connector.push_async.assert_not_called()
+
+
+def test_push_off_never_touches_the_connector_push_api():
+    cache, _allocator = _make_cache(page_size=4)
+    cache.flexkv_connector.store_kv.return_value = 17
+    _finish_request(cache)
+    cache.flexkv_connector.check_completed_stores.return_value = ["finished-request"]
+
+    cache.check_hicache_events()
+
+    cache.flexkv_connector.push_async.assert_not_called()
+    cache.flexkv_connector.check_completed_pushes.assert_not_called()

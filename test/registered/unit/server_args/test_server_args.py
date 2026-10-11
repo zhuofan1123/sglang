@@ -155,6 +155,24 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_flexkv_push_flags_default_off_and_parse_from_cli(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        args.resolve_once()
+        self.assertFalse(resolution_result(args, "flexkv_push_on_finish"))
+        self.assertFalse(resolution_result(args, "flexkv_push_evict_local"))
+
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--flexkv-push-on-finish",
+                "--flexkv-push-evict-local",
+            ]
+        )
+        args.resolve_once()
+        self.assertTrue(resolution_result(args, "flexkv_push_on_finish"))
+        self.assertTrue(resolution_result(args, "flexkv_push_evict_local"))
+
     def test_prefill_decode_interval(self):
         args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
         args.resolve_once()

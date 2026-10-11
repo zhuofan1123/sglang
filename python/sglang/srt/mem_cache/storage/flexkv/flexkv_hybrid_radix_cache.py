@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -108,6 +108,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._pd_decode_store_only = self._pd_decode and bool(
             getattr(model_config, "is_deepseek_v4_arch", False)
         )
+        # Optional migration: push each finish-time store to a peer once local.
+        memory = get_memory()
+        self._push_on_finish = bool(memory.flexkv_push_on_finish)
+        self._push_evict_local = bool(memory.flexkv_push_evict_local)
+        self._push_after_store: dict[str, tuple[str, list[int]]] = {}
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(
@@ -183,6 +188,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 self._pending_store_launches.clear()
             if hasattr(self, "_pending_store_copies"):
                 self._pending_store_copies.clear()
+        self.__dict__.get("_push_after_store", {}).clear()
 
     def shutdown(self) -> None:
         # Prefer token_to_kv_pool_host.destroy() (HiCache path); keep this alias.
@@ -485,7 +491,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if not is_insert:
             return
 
-        self._store_prefix(req, token_ids)
+        self._store_prefix(req, token_ids, push_after=True)
 
     def cache_unfinished_req(self, req: Req, **kwargs) -> None:
         self._validate_restore_lease(req)
@@ -500,7 +506,9 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             return
         self._store_prefix(req, list(req.get_fill_ids()))
 
-    def _store_prefix(self, req: Req, token_ids: Sequence[int]) -> None:
+    def _store_prefix(
+        self, req: Req, token_ids: Sequence[int], *, push_after: bool = False
+    ) -> None:
         """Store a page-aligned prefix and its exact SWA/state snapshot."""
 
         aligned_length = len(token_ids) // self.page_size * self.page_size
@@ -534,6 +542,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             token_ids=token_ids,
             kv_indices=indices,
         )
+        if push_after and self.__dict__.get("_push_on_finish", False):
+            self._push_after_store[store_key] = (req.rid, token_ids)
         if self.__dict__.get("_async_store_slot_mapping", False):
             with self._node_lock:
                 self._pending_store_launches[store_key] = pending
@@ -545,6 +555,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             raise
         if task_id < 0:
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
+            self._push_stored_prefix(store_key)
             return
         with self._node_lock:
             self._inflight_store_nodes[store_key] = (
@@ -653,6 +664,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 raise
             if task_id < 0:
                 self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                self._push_stored_prefix(store_key)
                 continue
             with self._node_lock:
                 self._inflight_store_nodes[store_key] = (
@@ -694,6 +706,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
+        if self.__dict__.get("_push_on_finish", False):
+            self.flexkv_connector.check_completed_pushes()
         self._launch_pending_stores()
 
     def _drain_completed_stores(self) -> None:
@@ -706,6 +720,20 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 if tracked is not None:
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
+        for store_key in completed:
+            self._push_stored_prefix(store_key)
+
+    def _push_stored_prefix(self, store_key: str) -> None:
+        """Push the finish-time prefix recorded for ``store_key``; it is local now."""
+        entry = self.__dict__.get("_push_after_store", {}).pop(store_key, None)
+        if entry:
+            rid, token_ids = entry
+            self.flexkv_connector.push_async(
+                store_key,
+                token_ids,
+                evict_local=self._push_evict_local,
+                sglang_req_id=rid,
+            )
 
     def release_aborted_request(self, rid: str) -> None:
         self._load_markers.pop(rid, None)

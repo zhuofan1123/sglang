@@ -240,3 +240,19 @@ class Memory:
             "variable."
         ),
     ] = None
+    flexkv_push_on_finish: A[
+        bool,
+        (
+            "After a finished request's KV is stored into FlexKV, push the "
+            "stored prefix to a peer radixshmem node (target chosen by the "
+            "cluster's RHT). Needs --enable-flexkv on a distributed "
+            "radixshmem cluster; otherwise the push is a no-op."
+        ),
+    ] = False
+    flexkv_push_evict_local: A[
+        bool,
+        (
+            "With --flexkv-push-on-finish, evict the pushed prefix from the "
+            "local radixshmem node once the peer has committed it."
+        ),
+    ] = False

@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_disagg, get_spec
+from sglang.srt.runtime_context import get_disagg, get_memory, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -138,6 +138,11 @@ class FlexKVRadixCache(RadixCache):
 
         # PD decode has no FlexKV restore path: skip host lookups, keep storing.
         self._pd_decode = get_disagg().disaggregation_mode == "decode"
+        # Optional migration: push each finish-time store to a peer once local.
+        memory = get_memory()
+        self._push_on_finish = bool(memory.flexkv_push_on_finish)
+        self._push_evict_local = bool(memory.flexkv_push_evict_local)
+        self._push_after_store: dict[str, list[int]] = {}
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         # ``tp_group`` and ``attn_tp_group`` are sometimes passed
@@ -232,6 +237,7 @@ class FlexKVRadixCache(RadixCache):
                 self._inflight_store_nodes.clear()
                 self._pending_store_launches.clear()
                 self._pending_store_copies.clear()
+        self.__dict__.get("_push_after_store", {}).clear()
         super().reset()
 
     def shutdown(self) -> None:
@@ -723,6 +729,8 @@ class FlexKVRadixCache(RadixCache):
             return
 
         self.inc_lock_ref(new_last_node)
+        if self.__dict__.get("_push_on_finish", False):
+            self._push_after_store[req.rid] = list(token_ids)
         if self._async_store_slot_mapping:
             with self._node_lock:
                 if (
@@ -748,6 +756,7 @@ class FlexKVRadixCache(RadixCache):
             # Nothing to write back (either everything already in
             # FlexKV, or put_match failed / returned None).
             self.dec_lock_ref(new_last_node)
+            self._push_stored_prefix(req.rid)
             return
 
         with self._node_lock:
@@ -858,6 +867,7 @@ class FlexKVRadixCache(RadixCache):
                 raise
             if fkv_task_id < 0:
                 self.dec_lock_ref(pending.node)
+                self._push_stored_prefix(rid)
                 continue
             with self._node_lock:
                 self._inflight_store_nodes[rid] = pending.node
@@ -918,6 +928,8 @@ class FlexKVRadixCache(RadixCache):
         doesn't accumulate)."""
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
+        if self.__dict__.get("_push_on_finish", False):
+            self.flexkv_connector.check_completed_pushes()
         self._launch_pending_stores()
 
     def _drain_completed_stores(self) -> None:
@@ -929,6 +941,16 @@ class FlexKVRadixCache(RadixCache):
                 node = self._inflight_store_nodes.pop(rid, None)
                 if node is not None:
                     self.dec_lock_ref(node)
+        for rid in completed_rids:
+            self._push_stored_prefix(rid)
+
+    def _push_stored_prefix(self, rid: str) -> None:
+        """Push the finish-time prefix recorded for ``rid``; it is local now."""
+        token_ids = self.__dict__.get("_push_after_store", {}).pop(rid, None)
+        if token_ids:
+            self.flexkv_connector.push_async(
+                rid, token_ids, evict_local=self._push_evict_local, sglang_req_id=rid
+            )
 
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler
@@ -950,6 +972,7 @@ class FlexKVRadixCache(RadixCache):
             pending = self._pending_store_launches.pop(rid, None)
             pending_copy = self._pending_store_copies.pop(rid, None)
             node = self._inflight_store_nodes.pop(rid, None)
+        self.__dict__.get("_push_after_store", {}).pop(rid, None)
         if pending is not None:
             self.dec_lock_ref(pending.node)
         if pending_copy is not None:

@@ -738,3 +738,109 @@ def test_hybrid_reset_waits_for_staged_copy_and_connector_before_free(failure):
         assert cache._pending_store_copies["store"] is pending
         cache.token_to_kv_pool_allocator.free.assert_not_called()
         cache._inner_cache.reset.assert_not_called()
+
+
+def _hybrid_push_cache(*, store_results, evict_local=False):
+    inner = MagicMock()
+    inner.is_eagle = False
+    inner.root_node = object()
+    node = object()
+    indices = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
+    inner.match_prefix.return_value = SimpleNamespace(
+        last_device_node=node, device_indices=indices
+    )
+    dec_params = object()
+    inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: dec_params)
+    connector = MagicMock()
+    connector.store_kv.side_effect = list(store_results)
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    cache.flexkv_connector = connector
+    cache.page_size = 4
+    cache._node_lock = threading.Lock()
+    cache._store_generation = 0
+    cache._inflight_store_nodes = {}
+    cache._pending_store_launches = {}
+    cache._pending_store_copies = {}
+    cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
+    cache._push_on_finish = True
+    cache._push_evict_local = evict_local
+    cache._push_after_store = {}
+    return cache, node, dec_params
+
+
+def _hybrid_push_req():
+    return SimpleNamespace(
+        rid="request",
+        extra_key=None,
+        kv=SimpleNamespace(swa_evicted_seqlen=0, kv_committed_len=4),
+        origin_input_ids=array("q", [1, 2, 3, 4]),
+        output_ids=array("q"),
+        get_fill_ids=lambda: array("q", [1, 2, 3, 4]),
+    )
+
+
+def _hybrid_cuda_patches():
+    return (
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    )
+
+
+def test_hybrid_push_on_finish_pushes_after_the_finish_store_completes():
+    cache, node, dec_params = _hybrid_push_cache(store_results=[17], evict_local=True)
+    connector = cache.flexkv_connector
+    stream_patch, ctx_patch = _hybrid_cuda_patches()
+
+    with stream_patch, ctx_patch:
+        cache.cache_finished_req(_hybrid_push_req(), kv_len_to_handle=4)
+
+    assert cache._push_after_store == {
+        "request:flexkv-store:0": ("request", [1, 2, 3, 4])
+    }
+    connector.push_async.assert_not_called()
+
+    connector.check_completed_stores.return_value = ["request:flexkv-store:0"]
+    cache.check_hicache_events()
+
+    cache._inner_cache.dec_lock_ref.assert_called_once_with(node, dec_params)
+    connector.push_async.assert_called_once_with(
+        "request:flexkv-store:0",
+        [1, 2, 3, 4],
+        evict_local=True,
+        sglang_req_id="request",
+    )
+    connector.check_completed_pushes.assert_called_once_with()
+    assert cache._push_after_store == {}
+
+
+def test_hybrid_push_on_finish_pushes_at_once_when_the_store_is_skipped():
+    cache, _node, _dec_params = _hybrid_push_cache(store_results=[-1])
+    stream_patch, ctx_patch = _hybrid_cuda_patches()
+
+    with stream_patch, ctx_patch:
+        cache.cache_finished_req(_hybrid_push_req(), kv_len_to_handle=4)
+
+    cache.flexkv_connector.push_async.assert_called_once_with(
+        "request:flexkv-store:0",
+        [1, 2, 3, 4],
+        evict_local=False,
+        sglang_req_id="request",
+    )
+    assert cache._push_after_store == {}
+
+
+def test_hybrid_push_on_finish_skips_prefill_boundary_stores():
+    cache, _node, _dec_params = _hybrid_push_cache(store_results=[17])
+    stream_patch, ctx_patch = _hybrid_cuda_patches()
+
+    with stream_patch, ctx_patch:
+        cache.cache_unfinished_req(_hybrid_push_req())
+
+    assert cache._push_after_store == {}
+    cache.flexkv_connector.check_completed_stores.return_value = [
+        "request:flexkv-store:0"
+    ]
+    cache.check_hicache_events()
+    cache.flexkv_connector.push_async.assert_not_called()
