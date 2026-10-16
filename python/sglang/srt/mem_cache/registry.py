@@ -112,12 +112,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # FlexKV supplies its own host-tier path and composes with the unified
         # radix cache for SWA models. Select it before the built-in hybrid
         # cache branches so --enable-flexkv works for DeepSeek V4 as well.
-        import os
-
         from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 
-        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
@@ -197,7 +193,14 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = ctx.server_args.radix_cache_backend
-    if name:
+    if name == "flexkv":
+        # This built-in optional backend is imported lazily, so its explicit
+        # spelling must work without an unrelated earlier package import.
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        cache = _flexkv_factory(ctx)
+        source = "registered('flexkv')"
+    elif name:
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(

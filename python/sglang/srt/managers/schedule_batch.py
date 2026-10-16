@@ -99,6 +99,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -869,6 +870,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

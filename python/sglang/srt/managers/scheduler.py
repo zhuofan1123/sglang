@@ -456,7 +456,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
-        self.enable_flexkv = bool(get_memory().enable_flexkv)
+        self.enable_flexkv = bool(
+            get_memory().enable_flexkv or get_memory().radix_cache_backend == "flexkv"
+        )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -2818,7 +2820,7 @@ class Scheduler(
                 )
         elif self.enable_flexkv:
             logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
-            # Wait-complete FlexKV prefetch: tree_cache owns token selection.
+            # The adapter starts either legacy or chunked prefetch from its config.
             self.tree_cache.prefetch_request(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -3299,7 +3301,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if self.enable_hierarchical_cache or self.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3380,13 +3382,8 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        has_uncommitted_restore = getattr(
-            self.tree_cache, "has_uncommitted_restore", None
-        )
-
-        if self.chunked_req is not None and not (
-            has_uncommitted_restore is not None
-            and has_uncommitted_restore(self.chunked_req)
+        if self.chunked_req is not None and not self.tree_cache.has_uncommitted_restore(
+            self.chunked_req
         ):
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3413,7 +3410,7 @@ class Scheduler(
             # batch commits them to the radix cache. Do not rematch the request
             # in that window: match_prefix would otherwise replace the only
             # request-side reference before cache completion.
-            if has_uncommitted_restore is not None and has_uncommitted_restore(req):
+            if self.tree_cache.has_uncommitted_restore(req):
                 continue
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3446,6 +3443,11 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"
@@ -3474,8 +3476,9 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
+                    if self.enable_hierarchical_cache or self.enable_flexkv:
+                        # An idle FlexKV batch must retry when host-cache pressure
+                        # clears; no running decode can reset batch_is_full for it.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
@@ -3491,9 +3494,7 @@ class Scheduler(
                     # admission in this same pass. Freeing a layerwise restore
                     # here would race its asynchronous H2D writer, so fail loud
                     # if a future admission check violates that ordering.
-                    if has_uncommitted_restore is not None and has_uncommitted_restore(
-                        req
-                    ):
+                    if self.tree_cache.has_uncommitted_restore(req):
                         raise RuntimeError(
                             "Request was rejected after storage load-back: "
                             f"rid={req.rid}"

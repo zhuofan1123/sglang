@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -45,6 +46,17 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheRequestHandle:
+    rid: str
+    attempt_id: int
+
+
+class CacheRequestOutcome(Enum):
+    SUCCESS = auto()
+    ABORT = auto()
 
 
 @dataclasses.dataclass
@@ -379,8 +391,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Release attempt state; caches without prefetch state have nothing to drop."""
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        """Finish an attempt without cancelling successful asynchronous cache work."""
+        if outcome != CacheRequestOutcome.SUCCESS:
+            self.release_aborted_request(handle)
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
+
+    def has_uncommitted_restore(self, req: Any) -> bool:
+        """Whether a restore still owns device slots outside the cache.
+
+        Such a request must not be rematched from the waiting queue: the
+        rematch reassigns ``req.prefix_indices``, which is the only handle on
+        those slots until the normal cache path commits them. Caches that only
+        hand out slots they already own have nothing to report.
+        """
+        return False
 
     def supports_swa(self) -> bool:
         return False
