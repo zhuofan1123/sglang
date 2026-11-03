@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import pickle
 import uuid
 from array import array
@@ -940,6 +941,10 @@ class GenerateReqInput:
         )
         cache[i] = sub
         return sub
+
+
+class PrefillDispatchAckOutput(BaseReq, kw_only=True):
+    bootstrap_room: Optional[int] = None
 
 
 class TokenizedGenerateReqInput(BaseReq, kw_only=True):
@@ -2439,11 +2444,13 @@ def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
-    if _USE_PICKLE_IPC:
-        return socket.recv_pyobj(flags=flags)
-
     data = socket.recv(flags=flags)
-    return msgpack_decode(data)
+    obj = pickle.loads(data) if _USE_PICKLE_IPC else msgpack_decode(data)
+    if isinstance(obj, TokenizedGenerateReqInput):
+        from sglang.srt.managers.maas_ipc_delivery import trace
+        trace("socket_received", obj.rid, obj.bootstrap_room,
+              pid=os.getpid(), endpoint=socket.getsockopt_string(zmq.LAST_ENDPOINT))
+    return obj
 
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
@@ -2460,3 +2467,9 @@ async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
 
     data = await socket.recv(flags=flags)
     return msgpack_decode(data)
+
+
+def encode_for_acknowledged_dispatch(obj: Any) -> bytes:
+    if _USE_PICKLE_IPC:
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return msgpack_encode(obj)

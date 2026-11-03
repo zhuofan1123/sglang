@@ -82,12 +82,15 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    PrefillDispatchAckOutput,
+    encode_for_acknowledged_dispatch,
     async_sock_recv,
     async_sock_send,
     build_flat_input_top_logprobs_arrays,
     sock_send,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.maas_ipc_delivery import AcknowledgedDispatch
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -575,9 +578,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        await async_sock_send(self.send_to_scheduler, obj)
+        if (self._ipc_ack_enabled and isinstance(obj, TokenizedGenerateReqInput)
+                and obj.routed_dp_rank is not None):
+            payload = encode_for_acknowledged_dispatch(obj)
+            await self._ipc_delivery.send(
+                (obj.rid, obj.bootstrap_room),
+                lambda: self.send_to_scheduler.send(payload),
+            )
+        else:
+            await async_sock_send(self.send_to_scheduler, obj)
 
     def init_running_status(self):
+        self._ipc_ack_enabled = os.environ.get("MAAS_PREFILL_IPC_ACK") == "1"
+        if self._ipc_ack_enabled:
+            assert get_disagg().disaggregation_mode == "prefill"
+            assert get_parallel().enable_dp_attention
+            assert get_serving().tokenizer_worker_num == 1
+            # Tokenizer has no distributed process group; validate launch config.
+            assert self.server_args.tp_size == self.server_args.dp_size
+            assert self.server_args.attn_cp_size == 1
+        self._ipc_delivery = AcknowledgedDispatch()
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
@@ -816,13 +836,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
+                    await self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request, state=state):
                         yield response
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
         except BaseException:
+            if self._ipc_ack_enabled and obj.is_single:
+                self.abort_request(rid=obj.rid, abort_all=False)
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -1552,7 +1574,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
-    def _send_one_request(
+    async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
@@ -1566,7 +1588,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
-            self._dispatch_to_scheduler(tokenized_obj)
+            await self._async_dispatch_to_scheduler(tokenized_obj)
             dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
@@ -1689,9 +1711,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *, state=None,
     ):
         """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
+        if state is None:
+            state = self.rid_to_state[obj.rid]
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
         while True:
@@ -1813,7 +1837,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[tmp_obj.rid]
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(self._wait_one_response(tmp_obj, request, state=state))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1830,8 +1854,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
+                        await self._send_one_request(tokenized_obj)
+                        generators.append(self._wait_one_response(tmp_obj, request, state=state))
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -1863,8 +1887,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
-                self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                state = self.rid_to_state[tmp_obj.rid]
+                await self._send_one_request(tokenized_obj)
+                await self._wait_one_response(tmp_obj, request, state=state).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -1883,8 +1908,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    await self._send_one_request(tokenized_obj)
+                    generators.append(self._wait_one_response(tmp_obj, request, state=state))
                     rids.append(tmp_obj.rid)
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
@@ -2156,6 +2181,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+            if isinstance(recv_obj, PrefillDispatchAckOutput):
+                self._ipc_delivery.acknowledge((recv_obj.rid, recv_obj.bootstrap_room))
+                # An IPC receipt is not a model output or health response.
+                continue
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),

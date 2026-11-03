@@ -2428,7 +2428,26 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
-    def handle_generate_request(
+    def _maas_admission_registry(self):
+        from sglang.srt.managers.maas_ipc_delivery import AdmissionRegistry
+        if not hasattr(self, "_maas_admissions"):
+            self._maas_admissions = AdmissionRegistry()
+        return self._maas_admissions
+
+    def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
+        if (os.environ.get("MAAS_PREFILL_IPC_ACK") == "1"
+                and recv_req.routed_dp_rank is not None):
+            from sglang.srt.managers.io_struct import PrefillDispatchAckOutput
+            registry = self._maas_admission_registry()
+            registry.admit((recv_req.rid, recv_req.bootstrap_room),
+                           lambda: self._handle_generate_request_impl(recv_req))
+            self.ipc_channels.send_to_tokenizer.send_output(
+                PrefillDispatchAckOutput(rid=recv_req.rid,
+                                         bootstrap_room=recv_req.bootstrap_room), recv_req)
+            return
+        return self._handle_generate_request_impl(recv_req)
+
+    def _handle_generate_request_impl(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
@@ -4618,6 +4637,8 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        if os.environ.get("MAAS_PREFILL_IPC_ACK") == "1" and not recv_req.abort_all:
+            self._maas_admission_registry().abort(recv_req.rid)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

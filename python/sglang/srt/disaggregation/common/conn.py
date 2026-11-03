@@ -1213,14 +1213,24 @@ class CommonKVSender(BaseKVSender):
             "bootstrap_room": self.bootstrap_room,
             "dp_rank": self.kv_mgr.attn_dp_rank,
         }
-        try:
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code != 200:
-                logger.error(
-                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to register prefill dp_rank: {e}")
+        from sglang.srt.managers.maas_ipc_delivery import trace
+        failure = ""
+        for attempt in range(3):
+            try:
+                response = requests.post(url, json=payload, timeout=2)
+                if response.status_code == 200:
+                    trace("bootstrap_registered", None, self.bootstrap_room,
+                          dp=self.kv_mgr.attn_dp_rank)
+                    return
+                failure = f"HTTP {response.status_code}: {response.text[:256]}"
+            except requests.RequestException as exc:
+                failure = str(exc)
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+        message = f"Prefill rank registration failed for room={self.bootstrap_room}: {failure}"
+        logger.error(message)
+        self.kv_mgr.record_failure(self.bootstrap_room, message)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices

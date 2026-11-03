@@ -812,8 +812,13 @@ class DataParallelController:
                 self.soft_watchdog.feed()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
-                except zmq.ZMQError:
+                except zmq.Again:
                     break
+                from sglang.srt.managers.maas_ipc_delivery import trace
+                trace("controller_received", getattr(recv_req, "rid", None),
+                      getattr(recv_req, "bootstrap_room", None))
+                # Every retry reaches the same externally selected scheduler.
+                # Admission/deduplication and ACK belong to that scheduler.
                 self._request_dispatcher(recv_req)
 
 
