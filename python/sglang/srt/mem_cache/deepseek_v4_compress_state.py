@@ -97,6 +97,7 @@ class CompressStatePool:
         state_cache_page_size: int = 1,
     ):
         self.ratio = ratio
+        self.request_scoped = ratio == 128
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
         self.page_size = state_cache_page_size
